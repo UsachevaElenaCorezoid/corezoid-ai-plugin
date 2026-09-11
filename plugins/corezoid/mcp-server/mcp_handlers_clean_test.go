@@ -269,3 +269,109 @@ func TestCleanDeleteAndCascade_NeverCascadesStartNode(t *testing.T) {
 		t.Errorf("expected S's dangling logic to R to be dropped, got %v", cleanNodeLogics(s))
 	}
 }
+
+// ---- cleanRemoveDelayToFinal: shape alone must not license a deletion ------
+// (regression for step 6 deleting hand-authored Delay nodes — "obj_type=0, no
+// logics, one time-semaphor to a final" is the canonical Delay node from
+// docs/nodes/delay-node.md, not only a leftover of cleaning.)
+
+func TestCleanRemoveDelayToFinal_KeepsUntouchedDelayNode(t *testing.T) {
+	// A --go--> DELAY --(time semaphor)--> END. Nothing about this process was
+	// cleaned: the delay is exactly as its author wrote it, and removing it
+	// would rewire A straight to END, so tasks that waited now finish at once.
+	nodeA := cleanNode("A", 0, []interface{}{cleanLogic("go", "DELAY", "")}, nil)
+	nodeDelay := cleanNode("DELAY", 0, nil, []interface{}{cleanSem("END")})
+	nodeEnd := cleanNode("END", 2, nil, nil)
+
+	nodes := []map[string]interface{}{nodeA, nodeDelay, nodeEnd}
+	origNmap := cleanSnapshotNodes(nodes)
+
+	nodes, dfCount := cleanRemoveDelayToFinal(nodes, origNmap)
+
+	if dfCount != 0 {
+		t.Errorf("removed %d delay node(s); an untouched delay→final node must be preserved", dfCount)
+	}
+	if cleanFindNode(nodes, "DELAY") == nil {
+		t.Fatal("hand-authored DELAY node was deleted — its callers now skip the wait entirely")
+	}
+	a := cleanFindNode(nodes, "A")
+	if got, _ := cleanNodeLogics(a)[0].(map[string]interface{})["to_node_id"].(string); got != "DELAY" {
+		t.Errorf("A's logic: got to_node_id=%q, want %q — A must still route through the delay", got, "DELAY")
+	}
+}
+
+func TestCleanRemoveDelayToFinal_RemovesNodeRewiredByCleanup(t *testing.T) {
+	// The case step 6 exists for: DELAY's semaphor originally pointed at a
+	// condition node C, which the cleanup deleted and redirected to END. The
+	// delay no longer gates any decision, so it goes.
+	origDelay := cleanNode("DELAY", 0, nil, []interface{}{cleanSem("C")})
+	origNodes := []map[string]interface{}{
+		cleanNode("A", 0, []interface{}{cleanLogic("go", "DELAY", "")}, nil),
+		origDelay,
+		cleanNode("C", 3, []interface{}{cleanLogic("go", "END", "")}, nil),
+		cleanNode("END", 2, nil, nil),
+	}
+	origNmap := cleanSnapshotNodes(origNodes)
+
+	// Current state: C removed, DELAY's semaphor already redirected to END.
+	nodeA := cleanNode("A", 0, []interface{}{cleanLogic("go", "DELAY", "")}, nil)
+	nodeDelay := cleanNode("DELAY", 0, nil, []interface{}{cleanSem("END")})
+	nodeEnd := cleanNode("END", 2, nil, nil)
+	nodes := []map[string]interface{}{nodeA, nodeDelay, nodeEnd}
+
+	nodes, dfCount := cleanRemoveDelayToFinal(nodes, origNmap)
+
+	if dfCount != 1 {
+		t.Fatalf("expected 1 delay→final removal, got %d", dfCount)
+	}
+	if cleanFindNode(nodes, "DELAY") != nil {
+		t.Error("DELAY should have been removed — the cleanup already collapsed what it gated")
+	}
+	a := cleanFindNode(nodes, "A")
+	if got, _ := cleanNodeLogics(a)[0].(map[string]interface{})["to_node_id"].(string); got != "END" {
+		t.Errorf("A's logic: got to_node_id=%q, want %q", got, "END")
+	}
+	if errs := cleanValidate(nodes); len(errs) != 0 {
+		t.Errorf("expected no dangling references, got: %v", errs)
+	}
+}
+
+func TestCleanNodeWasRewired_UnknownNodeIsNotDeletable(t *testing.T) {
+	// A node absent from the snapshot has unknown provenance. Reporting it as
+	// rewired would make every such node eligible for deletion on a guess.
+	orphan := cleanNode("ORPHAN", 0, nil, []interface{}{cleanSem("END")})
+	if cleanNodeWasRewired(orphan, map[string]map[string]interface{}{}) {
+		t.Error("a node missing from origNmap must be reported as untouched")
+	}
+}
+
+// ---- cleanApplyExclusions: structurally required inactive nodes -----------
+
+func TestCleanApplyExclusions_ProtectsEscalationChainAndGoTargets(t *testing.T) {
+	// LIVE is active. Its logic points at INACTIVE_GO (unconditional go) and
+	// escalates to ERRH, a condition node whose branch ends at ERR_FINAL.
+	// Every one of those is inactive, and every one is structurally required.
+	nodes := []map[string]interface{}{
+		cleanNode("LIVE", 0, []interface{}{cleanLogic("go", "INACTIVE_GO", "ERRH")}, nil),
+		cleanNode("INACTIVE_GO", 0, []interface{}{cleanLogic("go", "END", "")}, nil),
+		cleanNode("ERRH", 3, []interface{}{cleanLogic("go", "ERR_FINAL", "")}, nil),
+		cleanNode("ERR_FINAL", 2, nil, nil),
+		cleanNode("COLD", 0, []interface{}{cleanLogic("go", "END", "")}, nil),
+		cleanNode("END", 2, nil, nil),
+	}
+	activeIDs := map[string]bool{"LIVE": true, "END": true}
+	inactiveIDs := map[string]bool{
+		"INACTIVE_GO": true, "ERRH": true, "ERR_FINAL": true, "COLD": true,
+	}
+
+	excluded := cleanApplyExclusions(nodes, activeIDs, inactiveIDs)
+
+	for _, id := range []string{"INACTIVE_GO", "ERRH", "ERR_FINAL"} {
+		if !excluded[id] {
+			t.Errorf("%s must be excluded from removal — it is structurally required", id)
+		}
+	}
+	if excluded["COLD"] {
+		t.Error("COLD is inactive and unreferenced by any live node; it must stay removable")
+	}
+}

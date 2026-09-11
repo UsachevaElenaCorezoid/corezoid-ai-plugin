@@ -186,7 +186,7 @@ func handleCleanProcess(ctx context.Context, args map[string]interface{}) (strin
 	nodes, ptCount := cleanRemovePassThrough(nodes, origNmap)
 
 	// ── Step 6: Delay→final removal ───────────────────────────────────────────
-	nodes, dfCount := cleanRemoveDelayToFinal(nodes)
+	nodes, dfCount := cleanRemoveDelayToFinal(nodes, origNmap)
 
 	// ── Step 7: Validate ──────────────────────────────────────────────────────
 	validationErrors := cleanValidate(nodes)
@@ -211,6 +211,28 @@ func handleCleanProcess(ctx context.Context, args map[string]interface{}) (strin
 		), true
 	}
 
+	// A scheme that failed validation is never written. cleanValidate only
+	// reports structural damage — dangling to_node_id/err_node_id, or a node
+	// left with no way out — so the file would be unpushable anyway, and
+	// writing it means the next push-process (or a human reading the diff)
+	// is the thing that discovers the bug. Failing here keeps the damaged
+	// scheme in memory where it belongs.
+	if len(validationErrors) > 0 {
+		msg := fmt.Sprintf(
+			"Error: the cleaned scheme failed validation (%d problem(s)) — nothing was written.\n"+
+				"This is a bug in the cleanup, not something to fix by hand; please report process %d.",
+			len(validationErrors), processID,
+		)
+		for i, e := range validationErrors {
+			if i >= 10 {
+				msg += fmt.Sprintf("\n  … and %d more", len(validationErrors)-10)
+				break
+			}
+			msg += "\n  - " + e
+		}
+		return msg, true
+	}
+
 	// Update scheme
 	rawCleaned := make([]interface{}, 0, len(nodes))
 	for _, n := range nodes {
@@ -219,6 +241,21 @@ func handleCleanProcess(ctx context.Context, args map[string]interface{}) (strin
 	scheme["nodes"] = rawCleaned
 
 	// ── Save ──────────────────────────────────────────────────────────────────
+	//
+	// The cleaned scheme is a PROPOSAL for a human to review, not a mirror of
+	// what is deployed, and it deliberately does not end in ".conv.json".
+	// That suffix is what resolveProcessPath, the MCP resource listing, the
+	// git-sync process index and the env-var reference scan discover files by
+	// (see convFileName): landing a second ".conv.json" carrying the same
+	// obj_id next to the original makes resolveProcessPath ambiguous — every
+	// lint/layout/push call in that directory that relied on auto-discovery
+	// starts failing with "multiple .conv.json files found" — and makes
+	// git-sync index one process twice.
+	//
+	// ".cleaned.json" still starts with "<ID>_", which is all
+	// extractProcessIDFromPath needs, so `push-process` and `lint-process`
+	// accept the file when it is passed as an explicit process_path. The
+	// report below tells the user exactly that.
 	title, _ := procMap["title"].(string)
 	baseFileName := convFileName(processID, title)
 	const ext = ".conv.json"
@@ -226,7 +263,7 @@ func handleCleanProcess(ctx context.Context, args map[string]interface{}) (strin
 	if len(cleanedFileName) > len(ext) && cleanedFileName[len(cleanedFileName)-len(ext):] == ext {
 		cleanedFileName = cleanedFileName[:len(cleanedFileName)-len(ext)]
 	}
-	cleanedFileName += "_cleaned.conv.json"
+	cleanedFileName += ".cleaned.json"
 
 	var dir string
 	if parentID := int(cleanFloat(procMap["parent_id"])); parentID != 0 && v.StageID != 0 {
@@ -271,16 +308,18 @@ func handleCleanProcess(ctx context.Context, args map[string]interface{}) (strin
 			"  Active: %d, Inactive: %d, Stat-errors: %d\n"+
 			"  Excluded by rules: %d\n"+
 			"  Removed: %d initial + %d cascade + %d pass-through + %d delay→final\n"+
-			"Validation errors: %d\n"+
-			"Saved: %s",
+			"Validation: passed\n"+
+			"Saved: %s\n"+
+			"This is a reviewable proposal, not a pulled process — it is intentionally not a "+
+			".conv.json file, so review the diff first, then pass the path explicitly: "+
+			"lint-process/push-process with process_path=%s.",
 		processID, title,
 		originalCount, finalCount, originalCount-finalCount,
 		days,
 		len(activeIDs), len(inactiveIDs), len(errorIDs),
 		len(excluded),
 		initialRemoveCount, cascadeCount, ptCount, dfCount,
-		len(validationErrors),
-		filePath,
+		filePath, filePath,
 	)
 	if len(droppedErrHandlers) > 0 {
 		report += fmt.Sprintf("\n\nWarning: %d err_node_id reference(s) were dropped because the handler node was removed and had no unambiguous go-successor. Review these logics manually:", len(droppedErrHandlers))
@@ -302,18 +341,11 @@ func handleCleanProcess(ctx context.Context, args map[string]interface{}) (strin
 			report += "\n  - " + w
 		}
 	}
-	isErr := len(validationErrors) > 0
-	if isErr {
-		report += "\n\nValidation issues:"
-		for i, e := range validationErrors {
-			if i >= 10 {
-				report += fmt.Sprintf("\n  … and %d more", len(validationErrors)-10)
-				break
-			}
-			report += "\n  - " + e
-		}
-	}
-	return report, isErr
+	// A validation failure returned early above, so reaching here means the
+	// saved scheme is structurally sound. The dropped-reference warnings are
+	// not errors: the scheme is valid, a human just needs to confirm the lost
+	// branches were meant to go.
+	return report, false
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -908,10 +940,66 @@ func cleanRemovePassThrough(
 
 // ── Step 6: Delay→final removal ───────────────────────────────────────────────
 
+// cleanSemaphorTargetCounts returns the multiset of a node's semaphor
+// to_node_id values, so two versions of the same node can be compared without
+// depending on semaphor order.
+func cleanSemaphorTargetCounts(node map[string]interface{}) map[string]int {
+	counts := make(map[string]int)
+	for _, s := range cleanNodeSemaphors(node) {
+		sem, ok := s.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		tid, _ := sem["to_node_id"].(string)
+		counts[tid]++
+	}
+	return counts
+}
+
+// cleanNodeWasRewired reports whether this cleanup changed a node's outgoing
+// edges relative to the exported process. It is the guard that separates "this
+// node became a bare delay→final because we deleted what sat between them"
+// from "this node was authored as a delay→final and is doing its job".
+//
+// A node missing from origNmap is reported as untouched: unknown provenance is
+// not a licence to delete.
+func cleanNodeWasRewired(node map[string]interface{}, origNmap map[string]map[string]interface{}) bool {
+	id, _ := node["id"].(string)
+	orig := origNmap[id]
+	if orig == nil {
+		return false
+	}
+	if len(cleanNodeLogics(node)) != len(cleanNodeLogics(orig)) {
+		return true
+	}
+	cur, was := cleanSemaphorTargetCounts(node), cleanSemaphorTargetCounts(orig)
+	if len(cur) != len(was) {
+		return true
+	}
+	for tid, n := range cur {
+		if was[tid] != n {
+			return true
+		}
+	}
+	return false
+}
+
 // cleanRemoveDelayToFinal removes obj_type=0 nodes that have no logics and
 // whose every semaphor target is a final node (obj_type=2). This pattern
 // arises when a condition node between a delay and a final was removed.
-func cleanRemoveDelayToFinal(nodes []map[string]interface{}) ([]map[string]interface{}, int) {
+//
+// The "arises when ... was removed" part is load-bearing, which is why
+// origNmap is a parameter: "obj_type=0, no logics, one time-semaphor to a
+// final" is ALSO the canonical shape of a healthy, hand-built Delay node
+// (see docs/nodes/delay-node.md — "Delay 30 sec" → "Done"). Matching on
+// shape alone would delete that node out of every process it appears in and
+// rewire its callers straight to the final, so tasks that used to wait would
+// finish instantly. Only nodes this cleanup actually rewired are eligible —
+// cleanNodeWasRewired is the gate.
+func cleanRemoveDelayToFinal(
+	nodes []map[string]interface{},
+	origNmap map[string]map[string]interface{},
+) ([]map[string]interface{}, int) {
 	total := 0
 	changed := true
 	for changed {
@@ -926,6 +1014,9 @@ func cleanRemoveDelayToFinal(nodes []map[string]interface{}) ([]map[string]inter
 			logics := cleanNodeLogics(node)
 			sems := cleanNodeSemaphors(node)
 			if len(logics) != 0 || len(sems) == 0 {
+				continue
+			}
+			if !cleanNodeWasRewired(node, origNmap) {
 				continue
 			}
 			allFinal := true
