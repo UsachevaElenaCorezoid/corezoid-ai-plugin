@@ -318,7 +318,7 @@ Most tools identify a process with `process_path` (a local `.conv.json` file, as
 | `list-variables`    | List a stage's environment variables (secrets masked) |
 | `modify-variable`   | Change a variable's value/title/data_type or rename it — dry-run + confirm-gated |
 | `delete-variable`   | PERMANENTLY delete a variable (no recycle bin) — dry-run + confirm-gated |
-| `create-communications-orchestrator` | Build a multi-platform messenger robot (Telegram / Facebook Messenger / Viber / Apple Messages) — queues the `bot_wizzard` build, polls it every 3s up to 10 times, and returns the generated `folder_url` or the wizard's error |
+| `create-communications-orchestrator` | Build a multi-platform messenger robot (Telegram / Facebook Messenger / Viber / Apple Messages) — queues the `bot_wizzard` build, polls it every 3s up to 10 times, and returns the generated `folder_url` or the wizard's error. Irreversible, so it builds only with `apply=true` plus the confirm token its `apply=false` dry-run prints |
 | `create-dashboard`  | Create a new dashboard for visualizing node metrics |
 | `get-dashboard`     | Get a dashboard with its charts and series         |
 | `add-chart`         | Add a chart (column, pie, funnel, table) to a dashboard |

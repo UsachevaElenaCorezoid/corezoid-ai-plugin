@@ -3,7 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -106,10 +110,177 @@ func callCommsTool(t *testing.T, m *commsMock, args map[string]interface{}) (str
 	stageID = 647738
 	t.Cleanup(func() { accountURL = origAccount; stageID = origStage })
 
+	// Drive the tool past its apply/confirm gate by default so the tests below
+	// keep asserting build behaviour rather than the gate. Tests that exercise
+	// the gate itself pass apply/confirm explicitly and are left alone.
+	if _, set := args["apply"]; !set {
+		args["apply"] = true
+	}
+	if _, set := args["confirm"]; !set {
+		args["confirm"] = commsConfirmTokenForArgs(args)
+	}
+
 	return handleToolCall(context.Background(), "create-communications-orchestrator", args)
 }
 
+// commsConfirmTokenForArgs rebuilds the token the handler will demand for these
+// arguments, mirroring how callCommsTool configures the stage. Tests that care
+// about the token's exact shape assert a literal instead of calling this.
+func commsConfirmTokenForArgs(args map[string]interface{}) string {
+	stage := 647738
+	if v, ok := argInt(args, "stage_id"); ok && v != 0 {
+		stage = v
+	}
+	ms, err := parseMessengers(args["messengers"])
+	if err != nil {
+		return "" // malformed input is rejected before the gate is reached
+	}
+	channels := make([]string, 0, len(ms))
+	for _, m := range ms {
+		channels = append(channels, fmt.Sprint(m["channel"]))
+	}
+	return commsConfirmToken(stage, channels)
+}
+
 const commsTelegramOnly = `[{"channel":"telegram","key":"1234"}]`
+
+// End-to-end guard that the handler uses reqOnce and not req. The doWithRetry
+// unit tests prove maxAttempts=1 works; this proves the orchestrator actually
+// asks for it, so swapping the call back to v.req fails here instead of turning
+// one 503 into two ~150-process builds in production.
+func TestCommsOrchestrator_CreateIsNeverRetried(t *testing.T) {
+	shortenRetryDelays(t)
+	resetGlobals(t)
+	t.Chdir(t.TempDir())
+
+	var createCalls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Ops []map[string]interface{} `json:"ops"`
+		}
+		json.NewDecoder(r.Body).Decode(&body) //nolint:errcheck
+		if len(body.Ops) > 0 {
+			typ, _ := body.Ops[0]["type"].(string)
+			obj, _ := body.Ops[0]["obj"].(string)
+			if typ == "create" && obj == "bot_wizzard" {
+				// Corezoid accepted the job and then failed to answer — the
+				// exact shape where a retry duplicates the build.
+				atomic.AddInt32(&createCalls, 1)
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{ //nolint:errcheck
+			"request_proc": "ok",
+			"ops": []interface{}{map[string]interface{}{
+				"proc": "ok", "obj_id": float64(647738), "parent_obj_id": float64(647737),
+				"title": "dev", "obj_type": float64(3),
+			}},
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	setProjectAuth(t, srv.URL)
+	origAccount, origStage := accountURL, stageID
+	accountURL = "https://account.test"
+	stageID = 647738
+	t.Cleanup(func() { accountURL = origAccount; stageID = origStage })
+
+	out, isErr := handleToolCall(context.Background(), "create-communications-orchestrator", map[string]interface{}{
+		"messengers": commsTelegramOnly,
+		"apply":      true,
+		"confirm":    "orchestrator@stage#647738:telegram",
+	})
+	if !isErr {
+		t.Fatalf("a 503 on create must surface as an error, got: %s", out)
+	}
+	if n := atomic.LoadInt32(&createCalls); n != 1 {
+		t.Fatalf("create was delivered %d times, want exactly 1 — every extra delivery is another ~150-process build", n)
+	}
+	// The user has to be told the build may exist anyway, or they will re-run
+	// the tool and get the duplicate the no-retry rule just prevented.
+	if !strings.Contains(out, "check stage") {
+		t.Errorf("the error should tell the user to check the stage before retrying, got: %s", out)
+	}
+}
+
+// The gate is the only thing standing between a stray tool call and ~150
+// irreversible processes, so it gets tested for the property that matters:
+// nothing reaches the API until an exact, matching token arrives.
+func TestCommsOrchestrator_GateBlocksTheBuild(t *testing.T) {
+	cases := []struct {
+		name  string
+		args  map[string]interface{}
+		isErr bool
+		want  string
+	}{
+		{
+			name:  "no apply is a dry-run, not an error",
+			args:  map[string]interface{}{"messengers": commsTelegramOnly, "apply": false, "confirm": ""},
+			isErr: false,
+			want:  "DRY-RUN",
+		},
+		{
+			name:  "apply without a confirm token is refused",
+			args:  map[string]interface{}{"messengers": commsTelegramOnly, "apply": true, "confirm": ""},
+			isErr: true,
+			want:  "Confirmation required",
+		},
+		{
+			name:  "a token for a different channel set is refused",
+			args:  map[string]interface{}{"messengers": commsTelegramOnly, "apply": true, "confirm": "orchestrator@stage#647738:telegram+viber"},
+			isErr: true,
+			want:  "Confirmation required",
+		},
+		{
+			name:  "a token for a different stage is refused",
+			args:  map[string]interface{}{"messengers": commsTelegramOnly, "apply": true, "confirm": "orchestrator@stage#999999:telegram"},
+			isErr: true,
+			want:  "Confirmation required",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &commsMock{checkResults: []map[string]interface{}{commsOKCheck("https://admin.corezoid.com/folder/9")}}
+			out, isErr := callCommsTool(t, m, tc.args)
+			if isErr != tc.isErr {
+				t.Errorf("isErr = %v, want %v; out = %s", isErr, tc.isErr, out)
+			}
+			if !strings.Contains(out, tc.want) {
+				t.Errorf("output should mention %q, got: %s", tc.want, out)
+			}
+			if m.createOp != nil {
+				t.Error("the build was queued despite the gate — this is the failure the gate exists to prevent")
+			}
+		})
+	}
+}
+
+// The dry-run has to carry the token verbatim: an agent that cannot copy it out
+// of the preview will either invent one or give up mid-build.
+func TestCommsOrchestrator_DryRunCarriesTheConfirmToken(t *testing.T) {
+	m := &commsMock{checkResults: []map[string]interface{}{commsOKCheck("https://admin.corezoid.com/folder/9")}}
+	out, isErr := callCommsTool(t, m, map[string]interface{}{
+		"messengers": `[{"channel":"viber","viber_token":"v"},{"channel":"telegram","key":"1234"}]`,
+		"apply":      false,
+		"confirm":    "",
+	})
+	if isErr {
+		t.Fatalf("a dry-run is not an error: %s", out)
+	}
+	// Channels are sorted, so the token does not depend on the order the caller
+	// happened to list them in.
+	if want := `confirm="orchestrator@stage#647738:telegram+viber"`; !strings.Contains(out, want) {
+		t.Errorf("dry-run should print %s, got: %s", want, out)
+	}
+	for _, phrase := range []string{"NO UNDO", "webhook", "~150 processes"} {
+		if !strings.Contains(out, phrase) {
+			t.Errorf("preview should warn about %q, got: %s", phrase, out)
+		}
+	}
+}
 
 // The whole point of the tool: the caller gets the folder the wizard built,
 // not just "queued". A result without folder_url is not a success.

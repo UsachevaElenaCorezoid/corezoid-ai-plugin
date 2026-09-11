@@ -145,6 +145,53 @@ func shortenRetryDelays(t *testing.T) {
 	})
 }
 
+// maxAttempts=1 is what Executor.reqOnce passes, and it is the whole defence
+// for ops the server does not deduplicate: a 503 must surface as an error after
+// exactly ONE delivery, never as a second attempt. The 503 here arrives after
+// the server has already "accepted" the work — the case where a retry would
+// silently create a second copy nobody knows about.
+func TestDoWithRetry_SingleAttemptDoesNotResend(t *testing.T) {
+	shortenRetryDelays(t)
+
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(srv.Close)
+
+	_, _, err := doWithRetry(context.Background(), srv.Client(), "POST", srv.URL, "json", []byte(`{}`), "tkn", "", "", 1, false)
+	if err == nil {
+		t.Fatal("expected an error when the only attempt returns 503")
+	}
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Fatalf("the request was delivered %d times, want exactly 1 — a retry here duplicates whatever the op created", n)
+	}
+}
+
+// A budget below 1 must still send the request once rather than silently
+// dropping it and reporting a failure that never touched the network.
+func TestDoWithRetry_ZeroAttemptsStillSendsOnce(t *testing.T) {
+	shortenRetryDelays(t)
+
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"ok":true}`)) //nolint:errcheck
+	}))
+	t.Cleanup(srv.Close)
+
+	resp, _, err := doWithRetry(context.Background(), srv.Client(), "POST", srv.URL, "json", []byte(`{}`), "tkn", "", "", 0, false)
+	if err != nil {
+		t.Fatalf("expected the request to be sent once, got %v", err)
+	}
+	resp.Body.Close()
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Fatalf("delivered %d times, want exactly 1", n)
+	}
+}
+
 func TestDoWithRetry_RetriesOn503ThenSucceeds(t *testing.T) {
 	shortenRetryDelays(t)
 
@@ -160,7 +207,7 @@ func TestDoWithRetry_RetriesOn503ThenSucceeds(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	resp, body, err := doWithRetry(context.Background(), srv.Client(), "POST", srv.URL, "json", []byte(`{}`), "tkn", "", "", false)
+	resp, body, err := doWithRetry(context.Background(), srv.Client(), "POST", srv.URL, "json", []byte(`{}`), "tkn", "", "", apiMaxAttempts, false)
 	if err != nil {
 		t.Fatalf("expected success after retries, got %v", err)
 	}
@@ -190,7 +237,7 @@ func TestDoWithRetry_RetriesOn429(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	resp, _, err := doWithRetry(context.Background(), srv.Client(), "POST", srv.URL, "json", []byte(`{}`), "tkn", "", "", false)
+	resp, _, err := doWithRetry(context.Background(), srv.Client(), "POST", srv.URL, "json", []byte(`{}`), "tkn", "", "", apiMaxAttempts, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -210,7 +257,7 @@ func TestDoWithRetry_DoesNotRetry4xx(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	resp, _, err := doWithRetry(context.Background(), srv.Client(), "POST", srv.URL, "json", []byte(`{}`), "tkn", "", "", false)
+	resp, _, err := doWithRetry(context.Background(), srv.Client(), "POST", srv.URL, "json", []byte(`{}`), "tkn", "", "", apiMaxAttempts, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -233,7 +280,7 @@ func TestDoWithRetry_GivesUpAfterMaxAttempts(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	resp, _, err := doWithRetry(context.Background(), srv.Client(), "POST", srv.URL, "json", []byte(`{}`), "tkn", "", "", false)
+	resp, _, err := doWithRetry(context.Background(), srv.Client(), "POST", srv.URL, "json", []byte(`{}`), "tkn", "", "", apiMaxAttempts, false)
 	if err == nil {
 		if resp != nil {
 			resp.Body.Close()
@@ -264,7 +311,7 @@ func TestDoWithRetry_CancelDuringBackoff(t *testing.T) {
 		cancel()
 	}()
 
-	_, _, err := doWithRetry(ctx, srv.Client(), "POST", srv.URL, "json", []byte(`{}`), "tkn", "", "", false)
+	_, _, err := doWithRetry(ctx, srv.Client(), "POST", srv.URL, "json", []byte(`{}`), "tkn", "", "", apiMaxAttempts, false)
 	if err == nil {
 		t.Fatal("expected context.Canceled error, got nil")
 	}
@@ -366,7 +413,7 @@ func TestDoWithRetry_SetsOriginHeader(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	resp, _, err := doWithRetry(context.Background(), srv.Client(), "POST", srv.URL, "json", []byte(`{}`), "tkn", "", "", false)
+	resp, _, err := doWithRetry(context.Background(), srv.Client(), "POST", srv.URL, "json", []byte(`{}`), "tkn", "", "", apiMaxAttempts, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

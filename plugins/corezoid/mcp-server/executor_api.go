@@ -30,8 +30,35 @@ var (
 	apiRetryMaxDelayVar  = 5 * time.Second
 )
 
-// req sends an authenticated JSON-RPC request to the Corezoid API.
+// req sends an authenticated JSON-RPC request to the Corezoid API, retrying
+// transient 429/503 responses. Safe for every op whose duplicate is harmless
+// or cheap to undo — which is all of them except the ones reqOnce exists for.
 func (v *Executor) req(method string, ops []map[string]any) (map[string]interface{}, error) {
+	return v.reqAttempts(method, ops, apiMaxAttempts)
+}
+
+// reqOnce sends the request without any retry, and is the right call for an
+// op that creates state the server does not deduplicate and the user cannot
+// cheaply undo.
+//
+// The distinction matters because a 429/503 is not proof the request was
+// rejected: Corezoid can accept a job and still fail to deliver its response.
+// A retry then queues a second job, and the caller only ever learns about the
+// second one's id — the first becomes orphaned state nobody knows to clean up.
+// For most creates that is a duplicate object in a folder listing: visible,
+// and one delete away. For `bot_wizzard create` it is ~150 processes plus a
+// silent webhook takeover of whatever bot already served that channel token,
+// which is why that op is the one caller here today.
+//
+// The trade is deliberate: opting out of retry means a genuinely transient
+// overload surfaces to the user as an error instead of recovering on its own.
+// That is the cheaper failure — it is loud, and the user can retry knowing
+// nothing was created.
+func (v *Executor) reqOnce(method string, ops []map[string]any) (map[string]interface{}, error) {
+	return v.reqAttempts(method, ops, 1)
+}
+
+func (v *Executor) reqAttempts(method string, ops []map[string]any, maxAttempts int) (map[string]interface{}, error) {
 	// Personal-workspace accounts have no companyID. The callers in this file
 	// unconditionally inject `"company_id": v.WorkspaceID` into every op, so when
 	// WorkspaceID is empty the payload carries `"company_id": ""` and Corezoid
@@ -76,7 +103,7 @@ func (v *Executor) req(method string, ops []map[string]any) (map[string]interfac
 	}
 
 	client := newHTTPClient()
-	resp, body, err := doWithRetry(v.Ctx, client, "POST", v.APIUrl, path, payloadJSON, v.Token, v.APILogin, v.APISecret, v.Debug)
+	resp, body, err := doWithRetry(v.Ctx, client, "POST", v.APIUrl, path, payloadJSON, v.Token, v.APILogin, v.APISecret, maxAttempts, v.Debug)
 	if err != nil {
 		return nil, err
 	}
@@ -168,19 +195,29 @@ func apiKeySign(secret, timestamp, body string) string {
 //   - If token != "": Simulator bearer token. URL = baseURL/api/2/path, header Authorization: Simulator <token>.
 //   - If token == "" and apiLogin+apiSecret != "": API key (double-salted SHA1). URL = baseURL/api/2/path/apiLogin/ts/sig, no auth header.
 //
-// The response body is rebuilt from `payloadJSON` on each attempt, so the body
-// must be idempotent — which it is, since Corezoid's JSON-RPC ops are.
+// The response body is rebuilt from `payloadJSON` on each attempt, so a retry
+// re-sends the identical op. Whether that is safe is the CALLER's call, not
+// this function's: Corezoid's JSON-RPC ops are not uniformly idempotent — every
+// `create` op mints a new object per delivery, and a 429/503 does not prove the
+// server rejected the first one. Callers that cannot tolerate a duplicate pass
+// maxAttempts=1 (see Executor.reqOnce); everyone else passes apiMaxAttempts.
 // For API key mode the timestamp+signature are recomputed fresh on each retry.
+//
+// maxAttempts < 1 is treated as 1 so a miscomputed budget still sends the
+// request once rather than silently dropping it.
 //
 // Returns the final response and the already-read body. Caller owns resp.Body
 // and must close it.
-func doWithRetry(ctx context.Context, client *http.Client, method, baseURL, path string, payloadJSON []byte, token, apiLoginArg, apiSecretArg string, debug bool) (*http.Response, []byte, error) {
+func doWithRetry(ctx context.Context, client *http.Client, method, baseURL, path string, payloadJSON []byte, token, apiLoginArg, apiSecretArg string, maxAttempts int, debug bool) (*http.Response, []byte, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
 	var lastErr error
 	delay := apiRetryBaseDelayVar
-	for attempt := 1; attempt <= apiMaxAttempts; attempt++ {
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		// Re-check cancellation before each attempt so a cancelled context
 		// fails fast even if we're mid-backoff.
 		if err := ctx.Err(); err != nil {
@@ -227,7 +264,7 @@ func doWithRetry(ctx context.Context, client *http.Client, method, baseURL, path
 		resp, err := client.Do(req)
 		if err != nil {
 			lastErr = err
-			logger.Error("Error making request (attempt %d/%d): %v", attempt, apiMaxAttempts, err)
+			logger.Error("Error making request (attempt %d/%d): %v", attempt, maxAttempts, err)
 			// Network errors aren't retried here — typed-error retry would
 			// require teasing apart "temporary" vs "permanent" failures, and
 			// in practice the Corezoid API surfaces overload as 429/503.
@@ -251,7 +288,7 @@ func doWithRetry(ctx context.Context, client *http.Client, method, baseURL, path
 		io.Copy(io.Discard, resp.Body) //nolint:errcheck
 		resp.Body.Close()
 
-		if attempt == apiMaxAttempts {
+		if attempt == maxAttempts {
 			lastErr = fmt.Errorf("API returned %d after %d attempts", resp.StatusCode, attempt)
 			break
 		}
@@ -260,7 +297,7 @@ func doWithRetry(ctx context.Context, client *http.Client, method, baseURL, path
 		if retryAfter > 0 && retryAfter > wait {
 			wait = retryAfter
 		}
-		logger.Warn("API status %d on attempt %d/%d — retrying in %s", resp.StatusCode, attempt, apiMaxAttempts, wait)
+		logger.Warn("API status %d on attempt %d/%d — retrying in %s", resp.StatusCode, attempt, maxAttempts, wait)
 		// Sleep but surface cancellation immediately. A bare time.Sleep would
 		// keep the goroutine alive long past a /cancel notification.
 		timer := time.NewTimer(wait)

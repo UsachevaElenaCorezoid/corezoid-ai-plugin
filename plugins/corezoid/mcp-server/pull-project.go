@@ -33,12 +33,40 @@ func fixMojibake(s string) string {
 
 // unzipFile extracts a ZIP archive to destDir using Go's archive/zip package.
 // Applies fixMojibake to entry names to handle servers that double-encode UTF-8 filenames.
+//
+// Two separate containment checks run per entry, because they stop two
+// different things. The ".." / absolute-path check rejects hostile names
+// inside the ARCHIVE. The symlink checks reject a hostile (or merely
+// surprising) link that already exists in the DESTINATION tree: os.Create
+// follows symlinks, so without them an entry named "docs/x.json" writes
+// wherever "docs" happens to point, and a plain name whose file is already a
+// symlink overwrites the link's target. Neither is reachable through the
+// archive-name check, since the name itself is perfectly ordinary.
 func unzipFile(src, destDir string) error {
 	r, err := zip.OpenReader(src)
 	if err != nil {
 		return fmt.Errorf("failed to open zip %s: %w", src, err)
 	}
 	defer r.Close()
+
+	// Create the root before resolving it. Every caller today writes the zip
+	// into destDir first, so it always exists — but the previous implementation
+	// created it implicitly via MkdirAll on the first entry's parent, and
+	// resolving a path that does not exist is an error. Without this line a
+	// caller that stops pre-creating the directory would get "failed to resolve
+	// extraction root" instead of an extraction.
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		return fmt.Errorf("failed to create extraction root %s: %w", destDir, err)
+	}
+
+	// Resolve the root once. The workspace itself may legitimately sit under a
+	// symlink — /tmp -> /private/tmp on macOS is the common case — so every
+	// check below compares a resolved path against a resolved root. Comparing
+	// raw strings would reject those ordinary setups.
+	rootReal, err := filepath.EvalSymlinks(destDir)
+	if err != nil {
+		return fmt.Errorf("failed to resolve extraction root %s: %w", destDir, err)
+	}
 
 	for _, f := range r.File {
 		name := fixMojibake(f.Name)
@@ -49,6 +77,14 @@ func unzipFile(src, destDir string) error {
 		}
 		destPath := filepath.Join(destDir, name)
 
+		// Check the deepest ancestor that already exists BEFORE creating
+		// anything: MkdirAll through a symlinked directory would happily
+		// create the missing components on the far side of the link, so
+		// checking afterwards would report an escape we had already made.
+		if err := ensureInsideRoot(filepath.Dir(destPath), rootReal); err != nil {
+			return fmt.Errorf("illegal zip path %s: %w", name, err)
+		}
+
 		if f.FileInfo().IsDir() {
 			if err := os.MkdirAll(destPath, 0755); err != nil {
 				return err
@@ -58,6 +94,12 @@ func unzipFile(src, destDir string) error {
 
 		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
 			return err
+		}
+
+		// The parent is now real directories all the way down, but the leaf
+		// itself can still be a pre-existing symlink pointing anywhere.
+		if fi, lerr := os.Lstat(destPath); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("illegal zip path %s: %s already exists as a symlink; refusing to write through it", name, destPath)
 		}
 
 		rc, err := f.Open()
@@ -77,6 +119,37 @@ func unzipFile(src, destDir string) error {
 		}
 	}
 	return nil
+}
+
+// ensureInsideRoot reports an error unless dir — with every symlink resolved —
+// is rootReal or lives beneath it.
+//
+// dir need not exist yet: the check walks up to the closest ancestor that does
+// and resolves that instead. Everything below an existing, contained ancestor
+// is created by MkdirAll as real directories, so containment of the ancestor
+// implies containment of the whole path.
+func ensureInsideRoot(dir, rootReal string) error {
+	probe := dir
+	for {
+		real, err := filepath.EvalSymlinks(probe)
+		if err == nil {
+			if real != rootReal && !strings.HasPrefix(real, rootReal+string(os.PathSeparator)) {
+				return fmt.Errorf("%s resolves to %s, outside the extraction root %s", probe, real, rootReal)
+			}
+			return nil
+		}
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("failed to resolve %s: %w", probe, err)
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			// Walked past the filesystem root without finding anything that
+			// exists. Cannot happen for a path under destDir, which we already
+			// resolved, but returning an error beats looping forever.
+			return fmt.Errorf("no existing ancestor of %s to resolve", dir)
+		}
+		probe = parent
+	}
 }
 
 // findStageDir looks for the root content directory inside an extracted Corezoid

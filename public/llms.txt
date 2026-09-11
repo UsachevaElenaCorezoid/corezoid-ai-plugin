@@ -39,7 +39,7 @@ The plugin bundles a Go MCP server (`convctl`) with these tools:
 - **add-to-group**: Add a user (or API key user) to a group
 - **create-alias**: Create a short alias for a Corezoid process
 - **create-api-key**: Create a new API key in the workspace
-- **create-communications-orchestrator**: Create a Communications Orchestrator: a multi-platform robot that handles messages from Telegram, Facebook Messenger, Viber and Apple Messages for Business
+- **create-communications-orchestrator**: Create a Communications Orchestrator: a multi-platform robot handling Telegram, Facebook Messenger, Viber and Apple Messages for Business
 - **create-dashboard**: Create a new Corezoid dashboard for visualizing process node metrics
 - **create-folder**: Create a new folder inside a parent Corezoid folder
 - **create-group**: Create a new user group in the current workspace

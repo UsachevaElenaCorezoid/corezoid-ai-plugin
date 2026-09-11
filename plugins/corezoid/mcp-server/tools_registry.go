@@ -216,7 +216,7 @@ var toolRegistry = []mcpTool{
 	},
 	{
 		Name:        "push-process",
-		Description: "Validate and deploy a process file to Corezoid. Runs lint-process first and blocks deploy-breaking findings; advisory findings do not block. Also blocks when the process changed on the server since pull, reporting local edits, server changes, true overlap, and the last known author. Resolve by re-pulling; or merge=true to write a reviewable local 3-way merge plus a .pre-merge backup without deploying; or overwrite_server_change=true to overwrite only after being shown the report. force=true does NOT waive the concurrency gate — it is the lint override only, so a force set for a lint finding can never pre-authorise dropping a concurrent change nobody has seen. Overwriting live server state that was never compared (overwrite_server_change or adopt_existing) while no pre-push snapshot exists is refused outright unless allow_no_snapshot=true is passed as well AND the target stage accepts that waiver: that combination is irreversible, so it is refused on immutable, production-like or unresolvable stages even with the flag, including on installations whose API has no snapshot object at all. A never-deployed process is exempt — it has no version to lose. Every waived gate is reported in the push result, not only in the server log. A pre-push server snapshot is always attempted for existing processes; if the snapshot API call itself fails, the push is blocked unless allow_no_snapshot=true is passed on a resolved mutable non-production-like stage (retry once the API recovers is the safer default). If the server-state fetch fails for any reason other than a genuine 'not found', the push is also blocked — the same API is about to be called by the deploy itself. Active Call Process Stub Mode (obj_type:4) is warning-only on a resolved mutable non-production-like stage, while immutable/prod/unknown stages require allow_active_stub_mode=true after explicit confirmation. force=true does not confirm Stub Mode. force=true also does NOT bypass structural lint findings (broken links, old-format nodes, self-referencing api_copy/api_rpc) — those describe an invalid graph the server rejects and must be fixed in the process design. The server regenerates node IDs and rewrites the local file with the canonical scheme, so reference nodes by title and re-read the file after push.",
+		Description: "Validate and deploy a process file to Corezoid. Runs lint-process first and blocks deploy-breaking findings; advisory findings do not block. Also blocks when the process changed on the server since pull, reporting local edits, server changes, true overlap, and the last known author. Resolve by re-pulling; or merge=true to write a reviewable local 3-way merge plus a .pre-merge backup without deploying; or overwrite_server_change=true to overwrite only after being shown the report. force=true is the generic-lint override ONLY: it never waives the concurrency gate (so a force set for a lint finding can never pre-authorise dropping a concurrent change nobody has seen), never confirms Stub Mode, and never bypasses structural lint findings (broken links, old-format nodes, self-referencing api_copy/api_rpc) — those describe an invalid graph the server rejects and must be fixed in the process design. A pre-push server snapshot is always attempted for existing processes. Overwriting live state that was never compared (overwrite_server_change or adopt_existing) with no snapshot, or pushing when the snapshot call itself failed, is refused unless allow_no_snapshot=true is passed AND the stage resolves as mutable and non-production-like: that combination is irreversible, so the flag is ignored on immutable, production-like or unresolvable stages, including installations whose API has no snapshot object at all (retrying once the API recovers is the safer default). A never-deployed process is exempt — it has no version to lose. Every waived gate is reported in the push result, not only in the server log. If the server-state fetch fails for any reason other than a genuine 'not found', the push is also blocked — the same API is about to be called by the deploy itself. Active Call Process Stub Mode (obj_type:4) is warning-only on a resolved mutable non-production-like stage, while immutable/prod/unknown stages require allow_active_stub_mode=true after explicit confirmation. The server regenerates node IDs and rewrites the local file with the canonical scheme, so reference nodes by title and re-read the file after push.",
 		Annotations: toolHints(hintMutates, hintDestructive, hintNonIdempotent, hintOpenWorld),
 		InputSchema: map[string]interface{}{
 			"type": "object",
@@ -853,39 +853,50 @@ var toolRegistry = []mcpTool{
 	},
 	{
 		Name:        "create-communications-orchestrator",
-		Description: "Create a Communications Orchestrator: a multi-platform robot that handles messages from Telegram, Facebook Messenger, Viber and Apple Messages for Business. Corezoid builds one folder of processes per channel asynchronously; this tool queues the build and polls it (every 3s, up to 10 checks), returning the folder_url of the generated folder on success or the wizard's error on failure. At least one messenger is required.",
-		// destructiveHint, even though the build only ADDS objects. The flag is
+		Description: "Create a Communications Orchestrator: a multi-platform robot handling Telegram, Facebook Messenger, Viber and Apple Messages for Business. Corezoid builds one folder of processes per channel asynchronously; this tool queues the build and polls it (every 3s, up to 10 checks), returning the generated folder_url or the wizard's error. At least one messenger is required. NO UNDO (~150 processes; a rebuild on a live channel token steals that bot's webhook): apply=false (default) returns a dry-run carrying the confirm token needed to build.",
+		// destructiveHint, even though the build only ADDS objects: the flag is
 		// what an MCP host reads to decide whether to ask the user first, and
 		// this call earns the prompt twice over: there is no undo for the ~150
 		// processes it creates, and a second build against a channel token that
 		// already serves a bot silently steals that bot's webhook — destroying
-		// a working integration without deleting a single object. The
-		// corezoid-gen-bot skill gates this behind its own confirmation step,
-		// but the tool is callable without the skill, and the annotation is the
-		// only gate on that path.
+		// a working integration without deleting a single object.
+		//
+		// The annotation is advice to the host, not a check, so the handler also
+		// demands the apply/confirm handshake the other irreversible tools use.
+		// The corezoid-gen-bot skill has its own confirmation step, but the tool
+		// is callable without the skill, and that path previously had no
+		// server-side gate at all.
 		Annotations: toolHints(hintMutates, hintDestructive, hintNonIdempotent, hintOpenWorld),
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"messengers": map[string]interface{}{
 					"type": "string",
-					"description": "JSON array of channel objects, at least one. One entry per channel, each with its own credential field: " +
+					"description": "JSON array of channel objects, at least one. One entry per channel with its own credential field: " +
 						`telegram {"channel":"telegram","key":"<bot token>"}, ` +
 						`viber {"channel":"viber","viber_token":"<token>"}, ` +
 						`fbmessenger {"channel":"fbmessenger","page_access_token":"<token>"}, ` +
-						`abc (Apple Messages for Business) {"channel":"abc","abc_token":"<token>","user_id":68381,"email":"me@example.com","name":"My Name"} — user_id/email/name are optional and identify the brand contact.`,
+						`abc {"channel":"abc","abc_token":"<token>","user_id":68381,"email":"me@example.com","name":"My Name"} — abc = Apple Messages for Business; user_id/email/name are an optional brand contact.`,
 				},
 				"stage_id": map[string]interface{}{
 					"type":        "integer",
-					"description": "Optional. Stage/folder ID to build the orchestrator in. Defaults to the current stage (resolved from the workspace's <id>_<name>.stage.json marker file).",
+					"description": "Optional. Stage/folder ID to build in. Defaults to the current stage (from the <id>_<name>.stage.json marker).",
 				},
 				"project_id": map[string]interface{}{
 					"type":        "integer",
-					"description": "Optional. Project ID that owns stage_id. Resolved from the stage when omitted.",
+					"description": "Optional. Project ID owning stage_id. Resolved from the stage when omitted.",
 				},
 				"lang": map[string]interface{}{
 					"type":        "string",
-					"description": "Optional. Language of the generated processes and bot replies (e.g. \"en\", \"uk\", \"ru\"). Defaults to \"en\".",
+					"description": "Optional. Language of generated processes and bot replies (e.g. \"en\", \"uk\", \"ru\"). Default \"en\".",
+				},
+				"apply": map[string]interface{}{
+					"type":        "boolean",
+					"description": "false (default) = preview only, nothing is created. true = build (also requires confirm).",
+				},
+				"confirm": map[string]interface{}{
+					"type":        "string",
+					"description": "Required when apply=true. Copy the exact token printed by the apply=false dry-run.",
 				},
 			},
 			"required": []string{"messengers"},

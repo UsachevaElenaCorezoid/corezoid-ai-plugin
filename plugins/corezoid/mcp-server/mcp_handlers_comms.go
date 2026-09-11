@@ -228,6 +228,16 @@ func commsCheckTargetID(args map[string]interface{}, key string) string {
 // The tool only reports success once the wizard hands back a folder_url: the
 // queued job can still fail on a bad channel token, and "created" without the
 // folder link is indistinguishable from a wizard that silently built nothing.
+//
+// The build is gated behind the same apply/confirm handshake the other
+// irreversible tools use (pause-process, move-folder, deploy-stage,
+// set-stage-immutable). destructiveHint tells an MCP host this call is worth a
+// prompt, but it is advice to the host, not a check we perform — and this is
+// the least reversible tool in the registry: no delete-orchestrator exists, the
+// build mints ~150 processes, and a second build against a channel token that
+// already serves a bot silently takes that bot's webhook. The corezoid-gen-bot
+// skill has its own confirmation step, but the tool is callable without the
+// skill, and that path had no server-side gate at all.
 func handleCreateCommsOrchestrator(ctx context.Context, args map[string]interface{}) (string, bool) {
 	messengers, err := parseMessengers(args["messengers"])
 	if err != nil {
@@ -268,6 +278,24 @@ func handleCreateCommsOrchestrator(ctx context.Context, args map[string]interfac
 		lang = "en"
 	}
 
+	channels := make([]string, 0, len(messengers))
+	for _, m := range messengers {
+		channels = append(channels, fmt.Sprint(m["channel"]))
+	}
+
+	// The token binds the approval to what the user actually saw: the target
+	// stage and the exact channel set. Adding a channel or retargeting the
+	// stage after the dry-run invalidates it, because either change builds a
+	// different bot against different credentials.
+	wantConfirm := commsConfirmToken(stageID, channels)
+	preview := commsOrchestratorPreview(stageID, projectID, lang, channels)
+	if !boolishArg(args, "apply") {
+		return fmt.Sprintf("%s\n\nDRY-RUN - nothing was created. Show this preview to the user, get explicit approval, then re-run with apply=true and confirm=%q.", preview, wantConfirm), false
+	}
+	if strings.TrimSpace(optStrArg(args, "confirm")) != wantConfirm {
+		return fmt.Sprintf("Confirmation required - nothing was created.\n\n%s\n\nAfter explicit user approval, re-run with apply=true and confirm=%q.", preview, wantConfirm), true
+	}
+
 	createOp := map[string]any{
 		"obj":        "bot_wizzard",
 		"type":       "create",
@@ -280,9 +308,12 @@ func handleCreateCommsOrchestrator(ctx context.Context, args map[string]interfac
 		"async":      true,
 	}
 
-	resp, err := v.req("json", []map[string]any{createOp})
+	// reqOnce, not req: this create has no server-side deduplication and no
+	// undo. A 429/503 retry could queue a second ~150-process build whose id
+	// the caller never learns. See Executor.reqOnce.
+	resp, err := v.reqOnce("json", []map[string]any{createOp})
 	if err != nil {
-		return fmt.Sprintf("Error: could not queue the Communications Orchestrator: %v", err), true
+		return fmt.Sprintf("Error: could not queue the Communications Orchestrator: %v. Nothing is confirmed to have been created, but a build may still have been queued — check stage %d before retrying.", err, stageID), true
 	}
 	op, err := firstOp(resp)
 	if err != nil {
@@ -293,12 +324,34 @@ func handleCreateCommsOrchestrator(ctx context.Context, args map[string]interfac
 		return "Error: Corezoid queued no job — the create response carried no obj_id", true
 	}
 
-	channels := make([]string, 0, len(messengers))
-	for _, m := range messengers {
-		channels = append(channels, fmt.Sprint(m["channel"]))
-	}
-
 	return waitForCommsOrchestrator(v, objID, channels)
+}
+
+// commsConfirmToken is the approval token for a Communications Orchestrator
+// build. Channels are sorted so the token does not depend on the order the
+// caller happened to list them in — the same build always asks for the same
+// token, and a token only stops matching when the build genuinely changes.
+func commsConfirmToken(stageID int, channels []string) string {
+	sorted := append([]string(nil), channels...)
+	sort.Strings(sorted)
+	return fmt.Sprintf("orchestrator@stage#%d:%s", stageID, strings.Join(sorted, "+"))
+}
+
+// commsOrchestratorPreview describes what the build will do, in the terms that
+// make the call worth stopping over: where it lands, what it costs, and the
+// one consequence that is not additive — the webhook takeover.
+func commsOrchestratorPreview(stageID, projectID int, lang string, channels []string) string {
+	sorted := append([]string(nil), channels...)
+	sort.Strings(sorted)
+	return fmt.Sprintf(`CREATE COMMUNICATIONS ORCHESTRATOR
+Target stage:   %d
+Target project: %d
+Channels:       %s
+Language:       %s
+Effect: Corezoid builds one folder of processes per channel — a recent single-channel build was ~150 processes.
+NO UNDO: there is no delete-orchestrator tool; removing the folder is manual work in the Corezoid UI.
+NOT ADDITIVE: if a channel token below already serves a live bot, this build takes over that bot's webhook and breaks the existing integration without deleting anything.`,
+		stageID, projectID, strings.Join(sorted, ", "), lang)
 }
 
 // waitForCommsOrchestrator polls `bot_wizzard` `check` until the build

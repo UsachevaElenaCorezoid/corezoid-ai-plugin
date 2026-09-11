@@ -122,6 +122,11 @@ first becomes ~150 dead processes someone removes by hand.
 
 - Check PLAN.md's `orchestrator.folder_id` before Phase 4. Set → resume from
   Phase 5.
+- The tool now refuses to build without `apply=true` plus a confirm token bound
+  to the target stage and channel set, so a stray call previews instead of
+  building. Treat that as a backstop, not as permission to skip the checks
+  here: the token is trivial to supply, and the gate cannot tell an approved
+  build from a repeated one.
 - Write the wizard's response into PLAN.md **immediately**. A crash between
   "wizard returned" and "plan updated" is the one state that cannot be
   recovered automatically.
@@ -467,17 +472,52 @@ comes from those files, not from a fresh conversation. Missing PLAN.md → refus
 and point at `/corezoid-gen-bot plan <ids>`. Do not re-prompt for anything they
 already hold; do not re-run Phase 2.
 
+**Channel tokens are the one exception, by design.** They are deliberately not
+in PLAN.md — `tokens_supplied: true` records only that the user had them — so
+`execute` in a new session legitimately has no way to read them back. Ask for
+the tokens of exactly the channels listed in `channels:`, once, immediately
+before §4.1, and say why you are asking: the plan stores no credentials. Take
+them from the chat straight into the wizard argument. Never write them to
+PLAN.md, a scratch file, or the summary to make the next session easier — that
+trade is the whole reason they are absent. If the user cannot supply a token
+now, stop before §4.1; a partial channel set builds a different bot and needs a
+different confirm token.
+
 **If `orchestrator.folder_id` is set, skip to Phase 5.**
 
 ### 4.1 Call the wizard, exactly once
 
+The tool gates itself: `apply=false` (the default) previews the build and
+returns nothing but a confirm token, and only `apply=true` with that exact token
+starts it. Two calls, always — the first is free, the second is not.
+
 ```
-create-communications-orchestrator
+create-communications-orchestrator                     # 1. preview
   messengers: "[{\"channel\":\"telegram\",\"key\":\"…\"},{\"channel\":\"viber\",\"viber_token\":\"…\"}]"
   stage_id:   {corezoid.stage_id}     # omit to use the marker's stage
   project_id: {corezoid.project_id}   # omit to resolve from the stage
   lang:       {lang}
 ```
+
+Show the preview to the user — it names the target stage, the channel set and
+what cannot be undone — and wait for the approval Phase 4's gate already
+requires. Then repeat the identical call with `apply: true` and the
+`confirm:` token the preview printed, copied verbatim:
+
+```
+create-communications-orchestrator                     # 2. build
+  messengers: "…"                     # byte-identical to the preview call
+  stage_id:   {corezoid.stage_id}
+  project_id: {corezoid.project_id}
+  lang:       {lang}
+  apply:      true
+  confirm:    "orchestrator@stage#{stage_id}:{channels, sorted, +-joined}"
+```
+
+The token is bound to the stage and the channel set. If it is rejected, the
+build did **not** start — something differs from what the user approved (a
+changed stage, an added or dropped channel). Re-run the preview and compare;
+never hand-assemble a token to make the call go through.
 
 `messengers` is a **JSON string**. The build is asynchronous; the tool polls it
 and returns only when the wizard hands back a `folder_url`:
@@ -495,9 +535,17 @@ appear only when non-empty.
 `folder_url`, `obj_id`, `webhooks_url`, `dashboard_url` and `built_at` into
 PLAN.md's `orchestrator:` block, then continue.
 
-- Error result → the message carries the wizard's own diagnosis, usually naming
-  the token it rejected. Report it verbatim, fix the token with the user, then
-  call again. A failed build creates nothing, so retrying is safe.
+- Error result from the **wizard** → the message carries its own diagnosis,
+  usually naming the token it rejected. Report it verbatim, fix the token with
+  the user, then call again from the preview. A wizard-rejected build creates
+  nothing, so retrying is safe.
+- **Transport error on the build call** (timeout, 429/503, connection dropped)
+  → the outcome is unknown, and the tool deliberately does not retry it: the
+  request is sent exactly once, because a second delivery would build a second
+  orchestrator. The message says to check the stage. Do that — look for a
+  `*_Communications_Orchestrator` folder created just now — and only call again
+  if none exists. If one does, record its `folder_id` in PLAN.md and resume from
+  Phase 5.
 - The folder the wizard builds is large — a recent single-channel build was 150
   processes. Count it from the pull rather than quoting a number; the figures in
   this document are illustrative and drift with the template.
@@ -544,14 +592,30 @@ prefix is exactly the `folder_id` recorded in §4.1 — the trailing number of t
 wizard's `folder_url`:
 
 ```bash
-stage_root="$(dirname "$(ls */*.stage.json *.stage.json 2>/dev/null | head -n1)")"
-orch="{orchestrator.folder_id}_Communications_Orchestrator"
+# Find the stage marker by walking UP from the current directory: it sits at
+# the workspace root, and a session started in a subfolder finds nothing with a
+# relative `ls`. Every path below is built from $stage_root — never relative to
+# the current directory.
+d="$PWD"
+while [ "$d" != "/" ] && [ -z "$(ls "$d"/*.stage.json "$d"/*/*.stage.json 2>/dev/null | head -n1)" ]; do
+  d="$(dirname "$d")"
+done
+marker="$(ls "$d"/*.stage.json "$d"/*/*.stage.json 2>/dev/null | head -n1)"
+[ -n "$marker" ] || { echo "no <id>_<name>.stage.json marker at or above $PWD — run corezoid-init"; exit 1; }
+stage_root="$(dirname "$marker")"
+
+orch="$stage_root/{orchestrator.folder_id}_Communications_Orchestrator"
 ls -d "$orch" || { echo "orchestrator folder not found — see the warning above"; exit 1; }
 ```
 
 If that directory is not there, **stop**: either the pull was scoped wrongly
 (the warning above) or the wizard built into a different stage than the marker
 points at. Do not proceed to read ids out of whatever else the pull produced.
+
+This check runs **after** the orchestrator already exists, so a failure here is
+never a reason to call the wizard again — the folder is in the stage whether or
+not this snippet found it. Resolve the path, or ask the user for the folder id
+from `folder_url`, and continue from Phase 5.
 
 Then read the real ids out of that directory into PLAN.md's `template_ids`. The
 filename prefix is the process id and each `*.folder.json` carries its folder's
@@ -1001,10 +1065,12 @@ Then report, in one compact block:
 
 ## Rules
 
-- **`create-communications-orchestrator` runs at most once per PLAN.md.** ~150
+- **`create-communications-orchestrator` builds at most once per PLAN.md.** ~150
   processes, no undo, and a second build steals the webhook from the first.
-  Check `orchestrator.folder_id`; write the response into PLAN.md before
-  anything else; never retry a timeout.
+  Check `orchestrator.folder_id`; preview with `apply=false` and get approval;
+  build with `apply=true` plus the token the preview printed; write the response
+  into PLAN.md before anything else; never retry a timeout or a transport error
+  without first checking the stage for a folder that already exists.
 - **Take inventory before pulling.** The workspace is usually an already-pulled
   stage; pull only the ids with no `<id>_*.conv.json` under the stage root.
   `pull-process` overwrites the local file, so a blind re-pull destroys unpushed
