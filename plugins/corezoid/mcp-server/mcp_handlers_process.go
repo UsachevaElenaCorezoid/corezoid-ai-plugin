@@ -232,7 +232,11 @@ func handlePullProcess(ctx context.Context, args map[string]interface{}) (string
 			parentID = int(pid)
 		}
 		if parentID != 0 && v.StageID != 0 {
-			resolved, resolveErr := v.resolveFolderPathFromAPI(parentID)
+			segments, resolveErr := v.resolveFolderChainFromAPI(parentID)
+			resolved := ""
+			for _, seg := range segments {
+				resolved = filepath.Join(resolved, seg.DirName())
+			}
 			if resolveErr != nil {
 				logger.Warn("pull-process: could not resolve folder path for parent_id %d: %v", parentID, resolveErr)
 			} else {
@@ -247,6 +251,15 @@ func handlePullProcess(ctx context.Context, args map[string]interface{}) (string
 				// workspace), fall back to the old CWD-relative behaviour.
 				if stageRoot := findStageRootFromCWD(v.StageID); stageRoot != "" {
 					dir = filepath.Join(stageRoot, resolved)
+					// Give every directory we are about to create its folder
+					// marker, so the pulled tree can be used as a create /
+					// push target instead of being a dead end.
+					if merr := ensureFolderMarkers(mirroredPlacement{
+						Dir: dir, StageRoot: stageRoot, Segments: segments,
+					}); merr != nil {
+						logger.Warn("pull-process: could not write folder markers under %s: %v", stageRoot, merr)
+						return fmt.Sprintf("Error preparing local mirror under %s: %v", stageRoot, merr), true
+					}
 				} else {
 					dir = resolved
 				}
@@ -481,9 +494,21 @@ func handlePushProcess(ctx context.Context, args map[string]interface{}) (string
 	//     shared clusters) never block; they are surfaced so the user sees them.
 	// Active Stub Mode has its own stage-aware gate because it bypasses the real
 	// called process at runtime.
+	// force waives generic blocking LINT findings and nothing else. The
+	// concurrency gate has its own waiver, overwrite_server_change: one boolean
+	// covering both meant a force passed for a lint finding also pre-authorised
+	// overwriting a concurrent server change that had not happened yet and was
+	// therefore never shown to anyone (see resolveConflict).
 	force, _ := args["force"].(bool)
+	overwriteServerChange, _ := args["overwrite_server_change"].(bool)
 	allowStubMode, _ := args["allow_active_stub_mode"].(bool)
-	var lintNote string // findings surfaced on a proceeding push (see below)
+	allowNoSnapshot, _ := args["allow_no_snapshot"].(bool)
+	var lintNote, lintNoteHeader string // findings surfaced on a proceeding push (see below)
+	// Every gate this push waived, reported in the tool result. A waiver visible
+	// only on stderr is not an audit trail: an MCP host is free to surface just
+	// the returned content, leaving "deployed successfully" as the whole record
+	// of an overridden safety check.
+	var waiverNotes []string
 	if lintRes, lintErr := lintProcess(filePath); lintErr == nil {
 		stubMode := len(lintRes.StubModeNodes)
 		if stubMode > 0 {
@@ -493,7 +518,8 @@ func handlePushProcess(ctx context.Context, args map[string]interface{}) (string
 					stubMode, policy.reason, FormatLintResult(lintRes)), true
 			}
 			if allowStubMode {
-				fmt.Fprintf(os.Stderr, "[lint] %d active Stub Mode node(s) allowed with allow_active_stub_mode=true (%s)\n", stubMode, policy.reason)
+				waiverNotes = append(waiverNotes, fmt.Sprintf(
+					"WARNING: allow_active_stub_mode=true was used — %d node(s) were deployed with active Stub Mode, which bypasses the real called process at runtime (%s).", stubMode, policy.reason))
 			} else {
 				fmt.Fprintf(os.Stderr, "[lint] %d active Stub Mode node(s) are warning-only for this push (%s)\n", stubMode, policy.reason)
 			}
@@ -508,24 +534,37 @@ func handlePushProcess(ctx context.Context, args map[string]interface{}) (string
 				overridable, FormatLintResult(lintRes)), true
 		}
 		if overridable > 0 && force {
-			fmt.Fprintf(os.Stderr, "[lint] %d blocking issue(s) overridden with force=true\n", overridable)
+			waiverNotes = append(waiverNotes, fmt.Sprintf(
+				"WARNING: force=true was used — %d lint finding(s) that block a push by default were overridden and deployed (listed below).", overridable))
+			// Reporting these under the old "non-blocking" heading was worse than
+			// not reporting them: the findings were there but the audit trail said
+			// they had never blocked anything.
+			lintNoteHeader = fmt.Sprintf("Lint — %d BLOCKING finding(s) overridden with force=true, deployed anyway:", overridable)
 		}
 		// The push proceeds. Surface any findings so the promise "advisory
 		// findings are shown but do not block" is actually kept — otherwise
 		// advisory-only issues would deploy silently and never be seen.
 		if overridable+advisory+stubMode > 0 {
 			lintNote = FormatLintResult(lintRes)
+			if lintNoteHeader == "" {
+				lintNoteHeader = "Lint (non-blocking, deployed anyway):"
+			}
 		}
 	}
 
 	// Concurrency gate: if this process was pulled and someone else changed it
 	// on the server since, a plain push would silently overwrite their edits
 	// (DeleteNotUsedNodes drops server nodes absent from the local scheme).
-	// Block with an impact report unless force=true. New/never-pulled processes
-	// have no baseline and are unaffected.
+	// Block with an impact report unless overwrite_server_change=true, which is
+	// meant to be passed in reply to that report — not ahead of it. New/never-
+	// pulled processes have no baseline and are unaffected.
 	merge, _ := args["merge"].(bool)
+	adoptExisting, _ := args["adopt_existing"].(bool)
+	// Set when the gate authorised writing over a live server version whose
+	// content was never reconciled. Paired with the snapshot outcome below.
+	overwroteLiveState, overwriteWaiver := false, ""
 	if objID := extractObjIDFromJSON(jsonContent); objID != 0 {
-		res := resolveConflict(v, filePath, objID, jsonContent, force, merge)
+		res := resolveConflict(v, filePath, objID, jsonContent, overwriteServerChange, merge, adoptExisting)
 		switch res.action {
 		case conflictBlock:
 			return res.message, true
@@ -533,42 +572,178 @@ func handlePushProcess(ctx context.Context, args map[string]interface{}) (string
 			return res.message, false // merged file written for review — do not push now
 		case conflictProceed:
 			if res.message != "" {
-				fmt.Fprintln(os.Stderr, res.message) // advisory (e.g. no baseline) — do not block
+				waiverNotes = append(waiverNotes, res.message)
 			}
+			overwroteLiveState, overwriteWaiver = res.overwroteLiveState, res.waiver
 		}
 	}
 
 	// Auto-snapshot: if the process already exists on the server (obj_id != 0),
-	// capture the current server state before overwriting. There are three
+	// capture the current server state before overwriting. There are four
 	// outcomes:
 	//   • snapshot succeeded → note it, push proceeds.
-	//   • snapshot skipped because project/stage aren't resolved → warning
-	//     only; the workspace isn't wired for snapshots (misconfigured env),
-	//     blocking would be a false positive.
-	//   • snapshot was attempted and the API returned an error → BLOCK. Without
-	//     git for .conv.json files the previous server version is unrecoverable
-	//     once ProcessJSON overwrites it, and the same Corezoid API that just
-	//     failed here is the one ProcessJSON is about to call anyway.
+	//   • the environment has no snapshot feature at all → note it, push
+	//     proceeds; CreateSnapshot is never called (see snapshot_support.go).
+	//   • snapshot skipped because project/stage aren't resolved → BLOCK, unless
+	//     the process has never been deployed or the caller passes
+	//     allow_no_snapshot=true on a resolved mutable stage. An unresolved
+	//     target is not evidence that this environment needs no rollback point;
+	//     it is an unknown safety configuration, and proceeding overwrites a
+	//     live process with no way back. See applySnapshotWaiverPolicy.
+	//   • snapshot was attempted and the API returned an error → BLOCK, unless the
+	//     process has never been deployed, or the caller passes
+	//     allow_no_snapshot=true on a resolved mutable stage (see
+	//     applySnapshotWaiverPolicy). Without git for .conv.json files the
+	//     previous server version is unrecoverable once ProcessJSON overwrites it,
+	//     and the same Corezoid API that just failed here is the one ProcessJSON is
+	//     about to call anyway. A never-deployed process is the exception: it has no
+	//     committed version and no nodes, CreateSnapshot rejects it, and there is no
+	//     previous state that could be lost — blocking there would make the
+	//     create-process → push-process flow impossible for every new process.
 	var snapshotNote string
-	if existingObjID := extractObjIDFromJSON(jsonContent); existingObjID != 0 {
-		if projectID, envNotice := resolveAndCacheProjectID(v); projectID != 0 && v.StageID != 0 {
+	snapshotTaken := false
+	// Kept in scope for the irreversibility gate below: when the target did
+	// resolve, the waiver there must be judged against the stage the snapshot
+	// would have gone to, not re-derived from parent_id.
+	snapshotProjectID := 0
+	// The target policy, if one of the branches below already read it. Carried
+	// rather than recomputed so the gate cannot reach a different verdict about
+	// the same push, and does not pay a second `show stage` round trip.
+	var waiverPolicy *stubModeStagePolicy
+	existingObjID := extractObjIDFromJSON(jsonContent)
+	if existingObjID != 0 {
+		projectID, envNotice := resolveAndCacheProjectID(v)
+		snapshotProjectID = projectID
+		// "Does this installation have snapshots at all" is asked BEFORE "could
+		// we resolve the target", because the answers mean different things and
+		// only one of them is worth blocking over. An unresolved target on an
+		// installation that HAS snapshots means a rollback point existed and we
+		// failed to take it. On an installation that has none, there was never
+		// a rollback point to take, and blocking would leave those environments
+		// unable to push existing processes at all while telling the user to
+		// "configure snapshots" that do not exist. The probe tolerates a zero
+		// project/stage: it keys on the conv, and its positive control is `list
+		// commits` for that same conv (see snapshot_support.go). An inconclusive
+		// probe answers "supported", so an unproven environment still blocks.
+		switch supported := snapshotsSupported(v, existingObjID, projectID, v.StageID); {
+		case !supported:
+			// No snapshot object in this installation: there is nothing to
+			// capture and nothing to block on, so the push just proceeds.
+			snapshotNote = "Auto-snapshot skipped: this Corezoid environment does not support snapshots. The platform holds no rollback point — keep the .conv.json under version control if you need one."
+
+		case projectID != 0 && v.StageID != 0:
 			name := extractProcessNameFromPath(filePath)
 			title := fmt.Sprintf("pre-push %s %s", name, time.Now().UTC().Format("2006-01-02 15:04"))
 			if snapObjID, snapVer, snapErr := v.CreateSnapshot(existingObjID, projectID, v.StageID, title); snapErr != nil {
 				logger.Warn("[snapshot] auto-snapshot failed: %v", snapErr)
-				return fmt.Sprintf(
-					"Push blocked: the pre-push snapshot of process #%d failed (%v). Without a snapshot the previous server version cannot be restored after this push. Retry once the Corezoid API is reachable — the deploy call that follows would fail against the same endpoint anyway.",
-					existingObjID, snapErr), true
+				switch {
+				case processNeverDeployed(v, existingObjID):
+					logger.Info("[snapshot] auto-snapshot skipped: process %d has never been deployed", existingObjID)
+					snapshotNote = fmt.Sprintf("Auto-snapshot skipped: process #%d has no deployed version yet, so there is no previous state to restore.", existingObjID)
+				default:
+					// Resolution succeeded — we know exactly which stage this
+					// would have landed on — so the waiver is checked against
+					// that stage directly rather than re-derived from
+					// parent_id (contrast the unresolved-target case below,
+					// which has to re-derive it).
+					policy := stubModePolicyForStage(v, v.StageID, projectID)
+					waiverPolicy = &policy
+					if allowed, why := applySnapshotWaiverPolicy(policy, allowNoSnapshot); allowed {
+						snapshotNote = fmt.Sprintf("Warning: auto-snapshot could not be taken for process #%d — the CreateSnapshot API call failed (%v) — and allow_no_snapshot=true was passed. NO ROLLBACK POINT EXISTS for the version this push overwrites (%s).", existingObjID, snapErr, why)
+					} else {
+						return fmt.Sprintf(
+							"Push blocked: the pre-push snapshot of process #%d failed (%v). Without a snapshot the previous server version cannot be restored after this push. %s\n\nRetry once the Corezoid API is reachable, or re-run with allow_no_snapshot=true to accept an irreversible push once you accept the risk. allow_no_snapshot is separate from force on purpose: force overrides a *known* conflict, this waives the ability to undo.",
+							existingObjID, snapErr, why), true
+					}
+				}
 			} else {
 				logger.Info("[snapshot] created version %d (obj_id=%d) for process %d", snapVer, snapObjID, existingObjID)
 				snapshotNote = fmt.Sprintf("Snapshot created before push (version %d, obj_id=%d).", snapVer, snapObjID)
+				snapshotTaken = true
 			}
-			if envNotice != "" && snapshotNote != "" {
-				snapshotNote += " " + envNotice
+
+		case processNeverDeployed(v, existingObjID):
+			// Nothing deployed yet, so there is no previous state a snapshot
+			// could preserve. This is the create-process → push-process flow.
+			snapshotNote = fmt.Sprintf("Auto-snapshot skipped: process #%d has no deployed version yet, so there is no previous state to restore.", existingObjID)
+
+		default:
+			// Snapshots exist here, the process has state to lose, and we could
+			// not resolve where to put the snapshot.
+			policy := stubModeStagePolicyForPush(v, jsonContent)
+			waiverPolicy = &policy
+			allowed, why := applySnapshotWaiverPolicy(policy, allowNoSnapshot)
+			if !allowed {
+				return fmt.Sprintf(
+					"Push blocked: process #%d already exists on the server and this environment does support snapshots, but no pre-push snapshot could be taken because project_id/stage_id could not be resolved%s — so there is no rollback point for the version this push would overwrite. %s\n\nFix the workspace configuration (re-run corezoid-init, or push from the folder whose stage marker names the target stage) so snapshots work, or re-run with allow_no_snapshot=true to accept an irreversible push. allow_no_snapshot is separate from force on purpose: force overrides a *known* conflict, this waives the ability to undo.",
+					existingObjID, envNoticeSuffix(envNotice), why), true
 			}
-		} else {
-			snapshotNote = "Warning: auto-snapshot skipped (project_id/stage_id not resolved). No rollback point exists — fix the workspace configuration to enable snapshots."
+			snapshotNote = fmt.Sprintf("Warning: auto-snapshot skipped for process #%d (project_id/stage_id not resolved) and allow_no_snapshot=true was passed. NO ROLLBACK POINT EXISTS for the version this push overwrote (%s).", existingObjID, why)
 		}
+		if envNotice != "" && snapshotNote != "" {
+			snapshotNote += " " + envNotice
+		}
+	}
+
+	// An unreconciled overwrite of live server state with no rollback point is
+	// the one combination in this handler that nothing can undo. Each waiver on
+	// its own is a defensible judgement call — one says "their change loses",
+	// the other says "no undo is available here". Together they mean the previous
+	// version is neither reported nor recoverable, and that is not something a
+	// single flag set for an unrelated reason should be able to reach. It is also
+	// the only path a misclassified snapshot capability can turn into data loss,
+	// so the check keys on the snapshot OUTCOME, not on why it was missing.
+	//
+	// A never-deployed process is the same exception it is for the snapshot gate
+	// itself: there is no committed version, so there is nothing this push can
+	// make unrecoverable and nothing a snapshot could have preserved. The
+	// concurrency path can still get here for one — a pulled-but-never-deployed
+	// process whose change_time moved — and refusing that would demand a second
+	// waiver to protect a version that does not exist. The check costs one read
+	// and only on the path that is about to block or warn anyway.
+	//
+	// What is honoured here is the POLICY-GATED waiver, not the raw flag.
+	// allow_no_snapshot promises in its own contract that it applies only on a
+	// stage that resolves and is mutable, and is refused on immutable,
+	// production-like or unresolvable targets — but the branch above asks that
+	// question only where it takes (or fails to take) a snapshot. On an
+	// installation whose API has no snapshot object it deliberately asks
+	// nothing, because blocking there would leave those environments unable to
+	// push at all. That left this gate as the only thing standing between the
+	// two waivers and an irreversible overwrite, reading the flag directly — so
+	// the stage policy did not apply in the one environment where the rollback
+	// point is missing permanently rather than transiently. On the other two
+	// paths the same policy already ran and returned early, so asking it again
+	// yields the same answer; it is not a second, stricter gate.
+	if overwroteLiveState && !snapshotTaken && !processNeverDeployed(v, existingObjID) {
+		if waiverPolicy == nil {
+			// Only the snapshotless branch gets here without a policy: it asks
+			// no question of its own, so the lookup is paid here, on the
+			// destructive path, rather than on every push to such an install.
+			policy := snapshotWaiverPolicyForTarget(v, jsonContent, v.StageID, snapshotProjectID)
+			waiverPolicy = &policy
+		}
+		allowed, why := applySnapshotWaiverPolicy(*waiverPolicy, allowNoSnapshot)
+		switch {
+		case waiverPolicy.requiresConfirmation:
+			// The target refuses the waiver whatever the caller passed. Keyed on
+			// the policy rather than on the flag: telling someone to pass
+			// allow_no_snapshot here would send them into a second, identical
+			// refusal — and telling someone who already passed it to pass it
+			// reads as a broken flag.
+			return fmt.Sprintf(
+				"Push blocked: %s waived the comparison against the live server version and no pre-push snapshot exists (%s), so this push would be irreversible — and allow_no_snapshot is not honoured on this target. %s\n\nAn irreversible overwrite is refused exactly where it is least recoverable. Re-pull and reconcile instead (pull-process, then push with merge=true), or push to a stage the waiver applies to.",
+				overwriteWaiver, strings.TrimSuffix(snapshotNote, "."), why), true
+		case !allowed:
+			return fmt.Sprintf(
+				"Push blocked: %s waived the comparison against the live server version, and no pre-push snapshot exists (%s). Together those two make this push irreversible — the version it overwrites is neither reported nor recoverable.\n\nEither restore one of the guarantees (re-pull and reconcile: pull-process, then push with merge=true; or fix the workspace configuration so a snapshot can be taken), or pass allow_no_snapshot=true in addition to accept an irreversible overwrite deliberately.",
+				overwriteWaiver, strings.TrimSuffix(snapshotNote, ".")), true
+		}
+		// Deliberate and allowed — but it is the most destructive thing this tool
+		// can do, so it is stated outright rather than left to be inferred from
+		// two flags and a snapshot line.
+		waiverNotes = append(waiverNotes, fmt.Sprintf(
+			"WARNING: allow_no_snapshot=true was combined with %s — this push overwrote live server state that was never compared to anything, with no rollback point. It CANNOT be undone. (%s)", overwriteWaiver, why))
 	}
 
 	if _, err := v.ProcessJSON(filePath, jsonContent); err != nil {
@@ -582,29 +757,49 @@ func handlePushProcess(ctx context.Context, args map[string]interface{}) (string
 	// committed, so the next push starts current instead of re-flagging our own
 	// change, and a later concurrent-edit conflict still has a 3-way ancestor
 	// (without this, a push→edit→push flow degrades to the delete-only report).
+	//
+	// A failure here cannot be undone (the deploy already happened) but it must
+	// not be silent: the local sidecars are what lost-update protection reads,
+	// so leaving them stale while reporting a clean deploy makes the next push
+	// either re-flag our own change as someone else's or lose the 3-way
+	// ancestor. The user has to know the local state is no longer trustworthy,
+	// so every failure is collected and reported alongside the success.
+	var staleStateNotes []string
 	if v.ProcessID != 0 {
 		dir := filepath.Dir(filePath)
-		if proc, gerr := v.GetProcessByID(v.ProcessID); gerr == nil {
-			if berr := writeBaseline(dir, v.ProcessID, baselineFromServer(proc)); berr != nil {
-				logger.Warn("push: could not refresh baseline for %d: %v", v.ProcessID, berr)
-			}
+		if proc, gerr := v.GetProcessByID(v.ProcessID); gerr != nil {
+			logger.Warn("push: could not read back process %d to refresh baseline: %v", v.ProcessID, gerr)
+			staleStateNotes = append(staleStateNotes, fmt.Sprintf("the deployed version of process #%d could not be read back (%v), so the concurrency baseline still points at the pre-push version", v.ProcessID, gerr))
+		} else if berr := writeBaseline(dir, v.ProcessID, baselineFromServer(proc)); berr != nil {
+			logger.Warn("push: could not refresh baseline for %d: %v", v.ProcessID, berr)
+			staleStateNotes = append(staleStateNotes, fmt.Sprintf("the concurrency baseline could not be written (%v)", berr))
 		}
-		if theirsConv, ok := exportConv(v); ok {
-			if aerr := writeAncestorScheme(dir, v.ProcessID, theirsConv); aerr != nil {
-				logger.Warn("push: could not refresh ancestor for %d: %v", v.ProcessID, aerr)
-			}
+		if theirsConv, ok := exportConv(v); !ok {
+			logger.Warn("push: could not export process %d to refresh the merge ancestor", v.ProcessID)
+			staleStateNotes = append(staleStateNotes, "the deployed scheme could not be exported, so the 3-way merge ancestor is stale")
+		} else if aerr := writeAncestorScheme(dir, v.ProcessID, theirsConv); aerr != nil {
+			logger.Warn("push: could not refresh ancestor for %d: %v", v.ProcessID, aerr)
+			staleStateNotes = append(staleStateNotes, fmt.Sprintf("the merge ancestor could not be written (%v)", aerr))
 		}
 	}
 
 	result := fmt.Sprintf("Process deployed successfully, ProcessID: %d", procID)
+	if len(staleStateNotes) > 0 {
+		result += fmt.Sprintf(
+			"\n\nWARNING: the deploy succeeded, but the local concurrency state was NOT updated — %s. Lost-update protection now compares against stale data: re-pull this process before editing it again, otherwise the next push may report your own change as someone else's conflict or fall back to a delete-only impact report.",
+			strings.Join(staleStateNotes, "; "))
+	}
 	if rehydrateNote != "" {
 		result += "\n" + rehydrateNote
 	}
 	if snapshotNote != "" {
 		result += "\n" + snapshotNote
 	}
+	if len(waiverNotes) > 0 {
+		result += "\n\n" + strings.Join(waiverNotes, "\n\n")
+	}
 	if lintNote != "" {
-		result += "\n\nLint (non-blocking, deployed anyway):\n" + lintNote
+		result += "\n\n" + lintNoteHeader + "\n" + lintNote
 	}
 	// Surface the git_call container build log so the user sees what the build
 	// service reported (progress + result), not just silence on success.
@@ -656,9 +851,9 @@ var runTaskFirstPollAfter = 300 * time.Millisecond
 // metadata from the server and never deploys the local file: all deployments
 // must pass through push-process and its safety gates first.
 func handleRunTask(ctx context.Context, args map[string]interface{}) (string, bool) {
-	filePath, err := resolveProcessPath(args, "process_path")
-	if err != nil {
-		return "Error: " + err.Error(), true
+	procID, filePath, errMsg := resolveProcessID(args, "process_path", "process_id")
+	if errMsg != "" {
+		return errMsg, true
 	}
 	dataStr, err := strArg(args, "data")
 	if err != nil {
@@ -679,14 +874,13 @@ func handleRunTask(ctx context.Context, args map[string]interface{}) (string, bo
 		waitSec = runTaskMaxWaitSec
 	}
 
-	procID, errMsg := extractProcessIDFromPath(filePath)
-	if errMsg != "" {
-		return errMsg, true
-	}
-	if info, statErr := os.Stat(filePath); statErr != nil {
-		return fmt.Sprintf("Error reading process file: %v", statErr), true
-	} else if info.IsDir() {
-		return fmt.Sprintf("Error reading process file: %s is a directory", filePath), true
+	// filePath is "" when process_id was used instead — nothing local to check.
+	if filePath != "" {
+		if info, statErr := os.Stat(filePath); statErr != nil {
+			return fmt.Sprintf("Error reading process file: %v", statErr), true
+		} else if info.IsDir() {
+			return fmt.Sprintf("Error reading process file: %s is a directory", filePath), true
+		}
 	}
 
 	v := NewValidator(ctx, procID)
@@ -936,6 +1130,7 @@ func createConv(ctx context.Context, args map[string]interface{}, convType strin
 	}
 
 	v := NewValidator(ctx, 0)
+	markerWarning := ""
 	processID, cerr := v.CreateEmptyConv(folderID, processName, "", convType)
 	if processID == 0 {
 		// Pass the server's reason through: "Stage is immutable" in the tool
@@ -958,8 +1153,30 @@ func createConv(ctx context.Context, args map[string]interface{}, convType strin
 		return fmt.Sprintf("Error marshaling process: %v", err), true
 	}
 
+	// Mirror pull-process's placement when the caller pinned the Corezoid folder
+	// but not the local one. Without this the two tools disagree about where a
+	// process lives on disk: create writes into the CWD while a later
+	// pull-process writes the same object into the folder tree that mirrors its
+	// parent_id — leaving two copies and split baseline sidecars.
+	if optStrArg(args, "folder_path") == "" {
+		if mirrored := mirroredDirForFolder(v, folderID); mirrored.Dir != "" {
+			folderPath = mirrored.Dir
+			// Materialize the folder markers together with the directories.
+			// Without them the tree we just created is a dead end: the next
+			// create-process run from it can't resolve its folder ID (see
+			// resolveFolderIDFromDir) and fails with "no <id>_<name>.folder.json".
+			if err := ensureFolderMarkers(mirrored); err != nil {
+				logger.Warn("create: could not write folder markers under %s: %v", mirrored.StageRoot, err)
+				markerWarning = fmt.Sprintf("Local mirror warning: could not prepare folder markers under %s: %v", mirrored.StageRoot, err)
+			}
+		}
+	}
+
 	fileName := convFileName(processID, processName)
 	filePath := filepath.Join(folderPath, fileName)
+	if err := os.MkdirAll(folderPath, 0o755); err != nil {
+		return fmt.Sprintf("Error creating folder %s: %v", folderPath, err), true
+	}
 	if err := os.WriteFile(filePath, data, 0644); err != nil {
 		return fmt.Sprintf("Error writing file: %v", err), true
 	}
@@ -968,8 +1185,155 @@ func createConv(ctx context.Context, args map[string]interface{}, convType strin
 	if convType == "state" {
 		label = "State diagram"
 	}
-	return fmt.Sprintf("%s '%s' created in Corezoid folder #%d (%s) and saved to %s",
-		label, processName, folderID, resolvedFrom, filePath), false
+	result := fmt.Sprintf("%s '%s' created in Corezoid folder #%d (%s) and saved to %s",
+		label, processName, folderID, resolvedFrom, filePath)
+	if markerWarning != "" {
+		result += "\nWarning: " + markerWarning
+	}
+	return result, false
+}
+
+// mirroredPlacement describes where a Corezoid folder is mirrored on disk:
+// the target directory, the local stage root it is anchored at, and the chain
+// of folders in between (stage root → target). Segments are what makes the
+// directories usable — each one needs its own <id>_<name>.folder.json marker.
+type mirroredPlacement struct {
+	Dir       string
+	StageRoot string
+	Segments  []folderPathSegment
+}
+
+// mirroredDirForFolder returns the local directory that mirrors folderID inside
+// the Corezoid tree — the same placement pull-process uses — with an empty Dir
+// when it cannot be determined (no stage marker, unresolvable folder, API
+// error). Callers keep their previous behaviour on an empty Dir, so this can
+// only improve placement.
+func mirroredDirForFolder(v *Executor, folderID int) mirroredPlacement {
+	if v == nil || folderID == 0 || v.StageID == 0 {
+		return mirroredPlacement{}
+	}
+	stageRoot := findStageRootFromCWD(v.StageID)
+	if stageRoot == "" {
+		return mirroredPlacement{}
+	}
+	segments, err := v.resolveFolderChainFromAPI(folderID)
+	if err != nil {
+		logger.Warn("create: could not resolve folder path for %d: %v", folderID, err)
+		return mirroredPlacement{}
+	}
+	dir := stageRoot
+	for _, seg := range segments {
+		dir = filepath.Join(dir, seg.DirName())
+	}
+	return mirroredPlacement{Dir: dir, StageRoot: stageRoot, Segments: segments}
+}
+
+// folderMarkerContent is the on-disk shape of a <id>_<name>.folder.json marker,
+// matching what a folder export writes.
+type folderMarkerContent struct {
+	Description string `json:"description"`
+	ObjID       int    `json:"obj_id"`
+	ObjType     int    `json:"obj_type"`
+	ParentID    int    `json:"parent_id"`
+	Title       string `json:"title"`
+}
+
+// writeFolderMarker writes dir's <id>_<name>.folder.json marker, creating dir
+// if needed. A server-pulled marker is preserved only after proving its *name*
+// identifies the folder this directory is meant to mirror: silently accepting
+// any marker here can direct the next create/push operation at a different
+// Corezoid folder after a copied or stale local directory is encountered.
+//
+// Only the file name is load-bearing — resolveFolderIDFromDir reads the ID from
+// it and never parses the body. An unexpected body is therefore logged and the
+// marker kept, not treated as fatal: markers inside a pulled workspace come out
+// of a server ZIP export whose exact shape is the server's to choose, and
+// refusing to mirror on an unfamiliar one would break healthy workspaces.
+func writeFolderMarker(dir string, seg folderPathSegment) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("creating directory '%s': %w", dir, err)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("reading directory '%s': %w", dir, err)
+	}
+	var markers []string
+	for _, entry := range entries {
+		if !entry.IsDir() && folderMarkerFileRe.MatchString(entry.Name()) {
+			markers = append(markers, entry.Name())
+		}
+	}
+	if len(markers) > 1 {
+		return fmt.Errorf("directory '%s' contains %d folder/stage markers (%s)", dir, len(markers), strings.Join(markers, ", "))
+	}
+	if len(markers) == 1 {
+		match := folderMarkerFileRe.FindStringSubmatch(markers[0])
+		markerID, _ := strconv.Atoi(match[1])
+		if markerID != seg.ID {
+			return fmt.Errorf("existing marker '%s' identifies folder %d, expected folder %d", markers[0], markerID, seg.ID)
+		}
+		if raw, err := os.ReadFile(filepath.Join(dir, markers[0])); err != nil {
+			logger.Warn("folder marker '%s' in '%s' could not be read: %v", markers[0], dir, err)
+		} else {
+			var marker folderMarkerContent
+			if err := json.Unmarshal(raw, &marker); err != nil {
+				logger.Warn("folder marker '%s' in '%s' is not valid JSON: %v", markers[0], dir, err)
+			} else if marker.ObjID != 0 && marker.ObjID != seg.ID {
+				logger.Warn("folder marker '%s' in '%s' has obj_id=%d, expected folder %d", markers[0], dir, marker.ObjID, seg.ID)
+			}
+		}
+		return nil
+	}
+
+	data, err := json.MarshalIndent(folderMarkerContent{
+		ObjID:    seg.ID,
+		ObjType:  0,
+		ParentID: seg.ParentID,
+		Title:    seg.Title,
+	}, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshaling folder marker for %d: %w", seg.ID, err)
+	}
+	name := fmt.Sprintf("%d_%s.folder.json", seg.ID, seg.SafeName)
+	tmp, err := os.CreateTemp(dir, ".folder-marker-*.tmp")
+	if err != nil {
+		return fmt.Errorf("creating temporary marker in '%s': %w", dir, err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o644); err != nil {
+		tmp.Close()
+		return fmt.Errorf("setting permissions on temporary marker: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("writing temporary marker: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("closing temporary marker: %w", err)
+	}
+	if err := os.Rename(tmpName, filepath.Join(dir, name)); err != nil {
+		return fmt.Errorf("installing folder marker '%s': %w", filepath.Join(dir, name), err)
+	}
+	return nil
+}
+
+// ensureFolderMarkers creates every directory level of a mirrored placement and
+// gives each one a folder marker, so a directory this tool materializes can be
+// used as a target by the next create-process / create-folder / push-process.
+func ensureFolderMarkers(p mirroredPlacement) error {
+	if p.StageRoot == "" {
+		return nil
+	}
+	dir := p.StageRoot
+	for _, seg := range p.Segments {
+		dir = filepath.Join(dir, seg.DirName())
+		if err := writeFolderMarker(dir, seg); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // resolveCreateTarget picks the Corezoid folder a create lands in: an explicit
@@ -1007,9 +1371,26 @@ func handleCreateFolder(ctx context.Context, args map[string]interface{}) (strin
 	}
 
 	v := NewValidator(ctx, 0)
+	markerWarning := ""
 	newFolderID, err := v.CreateFolder(parentFolderID, folderName, "")
 	if err != nil {
 		return fmt.Sprintf("Error creating folder '%s': %v", folderName, err), true
+	}
+
+	// Same divergence as createConv: an explicit parent folder_id with no
+	// parent_path used to mirror the new folder into the CWD, so the on-disk
+	// tree stopped matching the Corezoid tree that pull-folder reproduces.
+	if optStrArg(args, "parent_path") == "" {
+		if mirrored := mirroredDirForFolder(v, parentFolderID); mirrored.Dir != "" {
+			parentPath = mirrored.Dir
+			// The parent chain we are about to create needs markers too —
+			// otherwise those intermediate directories can't be used as
+			// targets for anything (see ensureFolderMarkers).
+			if err := ensureFolderMarkers(mirrored); err != nil {
+				logger.Warn("create-folder: could not write folder markers under %s: %v", mirrored.StageRoot, err)
+				markerWarning = fmt.Sprintf("Local mirror warning: could not prepare folder markers under %s: %v", mirrored.StageRoot, err)
+			}
+		}
 	}
 
 	safeName := sanitizeFileSegment(folderName)
@@ -1019,14 +1400,7 @@ func handleCreateFolder(ctx context.Context, args map[string]interface{}) (strin
 		return fmt.Sprintf("Error creating directory '%s': %v", dirPath, err), true
 	}
 
-	type folderFileContent struct {
-		Description string `json:"description"`
-		ObjID       int    `json:"obj_id"`
-		ObjType     int    `json:"obj_type"`
-		ParentID    int    `json:"parent_id"`
-		Title       string `json:"title"`
-	}
-	fileContent := folderFileContent{
+	fileContent := folderMarkerContent{
 		Description: "",
 		ObjID:       newFolderID,
 		ObjType:     0,
@@ -1043,8 +1417,12 @@ func handleCreateFolder(ctx context.Context, args map[string]interface{}) (strin
 		return fmt.Sprintf("Error writing folder file: %v", err), true
 	}
 
-	return fmt.Sprintf("Folder '%s' created in Corezoid folder #%d (%s) and saved to %s",
-		folderName, parentFolderID, parentResolvedFrom, filePath), false
+	result := fmt.Sprintf("Folder '%s' created in Corezoid folder #%d (%s) and saved to %s",
+		folderName, parentFolderID, parentResolvedFrom, filePath)
+	if markerWarning != "" {
+		result += "\nWarning: " + markerWarning
+	}
+	return result, false
 }
 
 // handleShowFolder returns metadata for a single folder (title, obj_type,
@@ -1276,6 +1654,143 @@ func readParentIDFromFile(filePath string) (int, bool) {
 		if n, err := strconv.Atoi(p); err == nil {
 			return n, n != 0
 		}
+	}
+	return 0, false
+}
+
+// processNeverDeployed reports whether a process that exists on the server has
+// never been deployed: no committed version and no nodes. Such a process holds no
+// state a snapshot could capture, and CreateSnapshot rejects it outright — so the
+// pre-push snapshot gate must not treat that rejection as a reason to block.
+//
+// The answer is fail-closed: true is returned only when the API response
+// positively confirms BOTH facts. A failed lookup, a missing field, an
+// unexpected type or a partial response all return false, keeping the
+// conservative "block the push" behaviour — this function is what disarms the
+// snapshot protection of an already-deployed process, so an ambiguous response
+// must never be read as "nothing to lose".
+func processNeverDeployed(v *Executor, objID int) bool {
+	if v == nil || objID == 0 {
+		return false
+	}
+	data, err := v.GetProcessByID(objID)
+	if err != nil || data == nil {
+		return false
+	}
+	return commitsConfirmedEmpty(data) && nodeListConfirmedEmpty(data)
+}
+
+// snapshotWaiverPolicyForTarget reads the target policy that decides whether
+// allow_no_snapshot may be honoured, from whichever description of the target is
+// the more trustworthy: a stage that resolved is asked about directly, an
+// unresolved one is re-derived from the process parent_id.
+//
+// Walking parent_id can fail where stage_id/project_id are perfectly well known,
+// so preferring the resolved pair is what keeps the irreversibility gate from
+// contradicting the snapshot branch that ran a few lines earlier.
+func snapshotWaiverPolicyForTarget(v *Executor, jsonContent string, stageID, projectID int) stubModeStagePolicy {
+	if stageID != 0 && projectID != 0 {
+		return stubModePolicyForStage(v, stageID, projectID)
+	}
+	return stubModeStagePolicyForPush(v, jsonContent)
+}
+
+// applySnapshotWaiverPolicy turns a target policy plus the flag into a verdict
+// on allow_no_snapshot, and always returns the reason so the block, the refusal
+// and the waiver notice can all state it.
+//
+// Waiving the rollback point is only ever acceptable somewhere a lost version is
+// cheap to recreate, so the waiver is gated on the same stage policy the Stub
+// Mode gate uses: it is honoured only on a stage that resolved and is mutable.
+// Anywhere that policy wants confirmation — an immutable stage, a
+// production-looking name, or a stage that could not be resolved or read at all
+// — the waiver is refused, because that is exactly where an irreversible
+// overwrite is least recoverable and where "I could not determine the target"
+// must not be allowed to mean "so anything goes". That holds for a transient
+// CreateSnapshot error as much as for an unresolved target, and — since the
+// irreversibility gate reuses this — for an installation that has no snapshot
+// object at all.
+//
+// The policy is passed in rather than read here so callers that already hold it
+// can reuse it: reading it again costs a `show stage` round trip and, worse,
+// lets two independently derived verdicts about the same push disagree.
+func applySnapshotWaiverPolicy(policy stubModeStagePolicy, allowNoSnapshot bool) (bool, string) {
+	switch {
+	case policy.requiresConfirmation:
+		return false, fmt.Sprintf("Target policy: %s — a rollback waiver is not accepted here even with allow_no_snapshot=true.", policy.reason)
+	case !allowNoSnapshot:
+		return false, fmt.Sprintf("Target policy: %s.", policy.reason)
+	default:
+		return true, policy.reason
+	}
+}
+
+// envNoticeSuffix renders resolveAndCacheProjectID's notice as a parenthetical,
+// so a block message can carry the reason the lookup came back empty.
+func envNoticeSuffix(envNotice string) string {
+	if envNotice == "" {
+		return ""
+	}
+	return " (" + envNotice + ")"
+}
+
+// commitsConfirmedEmpty reports whether the response states that the process
+// carries no committed version. It requires commits.version to be present and
+// numerically 0; last_confirmed_version, which baselineFromServer prefers when
+// present, vetoes the answer whenever it is anything but a confirmed 0.
+func commitsConfirmedEmpty(data map[string]interface{}) bool {
+	if lcv, present := data["last_confirmed_version"]; present {
+		n, ok := jsonNumberValue(lcv)
+		if !ok || n != 0 {
+			return false
+		}
+	}
+	commits, ok := data["commits"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	ver, present := commits["version"]
+	if !present {
+		return false
+	}
+	n, ok := jsonNumberValue(ver)
+	return ok && n == 0
+}
+
+// nodeListConfirmedEmpty reports whether the response states that the process
+// has no nodes. The list key must be present and an actual empty array — a
+// missing list, or a list of some other shape, means the response did not
+// answer the question.
+func nodeListConfirmedEmpty(data map[string]interface{}) bool {
+	list, present := data["list"]
+	if !present {
+		return false
+	}
+	nodes, ok := list.([]interface{})
+	return ok && len(nodes) == 0
+}
+
+// jsonNumberValue coerces the numeric spellings a Corezoid response can carry
+// (float64 from a plain decode, json.Number under UseNumber, an int from a
+// hand-built map, or a numeric string) to a float64. Anything else — nil,
+// bool, object, non-numeric string — reports false so the caller can treat the
+// field as unanswered rather than as zero.
+func jsonNumberValue(v interface{}) (float64, bool) {
+	switch t := v.(type) {
+	case float64:
+		return t, true
+	case float32:
+		return float64(t), true
+	case json.Number:
+		f, err := t.Float64()
+		return f, err == nil
+	case int:
+		return float64(t), true
+	case int64:
+		return float64(t), true
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(t), 64)
+		return f, err == nil
 	}
 	return 0, false
 }

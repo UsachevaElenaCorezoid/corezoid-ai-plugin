@@ -67,6 +67,9 @@ var toolHandlers = map[string]toolHandler{
 	"modify-task":       handleModifyTask,
 	"delete-task":       handleDeleteTask,
 
+	// communications orchestrator (multi-platform messenger robot)
+	"create-communications-orchestrator": handleCreateCommsOrchestrator,
+
 	// dashboards
 	"create-dashboard":     handleCreateDashboard,
 	"get-dashboard":        handleGetDashboard,
@@ -165,6 +168,14 @@ func handleToolCall(ctx context.Context, name string, args map[string]interface{
 		// no auth required
 	case isInSet(name, tokenOnlyTools):
 		if err := ensureTokenAuth(); err != nil {
+			return err.Error(), true
+		}
+		// These tools are exempt from the stage_id requirement — they are what
+		// the init flow uses to FIND a stage — but they still call the Corezoid
+		// API, so they need a base URL like everything else. Resolving it only
+		// in ensureAuth would leave exactly the pre-configuration tools talking
+		// to an empty host.
+		if err := ensureAPIURL(); err != nil {
 			return err.Error(), true
 		}
 	default:

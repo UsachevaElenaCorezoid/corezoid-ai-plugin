@@ -102,6 +102,82 @@ func TestUnzipFile_ZipSlip(t *testing.T) {
 	}
 }
 
+// A symlinked DIRECTORY in the destination tree is the case the ".."/absolute
+// guard cannot see: every entry name here is perfectly ordinary, and the escape
+// comes entirely from what already sits on disk.
+func TestUnzipFile_SymlinkedDirEscape(t *testing.T) {
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "victim.txt")
+	if err := os.WriteFile(victim, []byte("original"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	dest := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(dest, "docs")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	zipPath := makeZip(t, map[string]string{"docs/victim.txt": "overwritten"})
+	if err := unzipFile(zipPath, dest); err == nil {
+		t.Error("expected an error for a write through a symlinked directory, got nil")
+	}
+
+	data, err := os.ReadFile(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "original" {
+		t.Errorf("file outside the extraction root was modified: got %q, want %q", data, "original")
+	}
+}
+
+// The leaf can be a symlink even when every parent directory is real.
+func TestUnzipFile_SymlinkedFileEscape(t *testing.T) {
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "victim.txt")
+	if err := os.WriteFile(victim, []byte("original"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	dest := t.TempDir()
+	if err := os.Symlink(victim, filepath.Join(dest, "hello.txt")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	zipPath := makeZip(t, map[string]string{"hello.txt": "overwritten"})
+	if err := unzipFile(zipPath, dest); err == nil {
+		t.Error("expected an error for a write through a symlinked file, got nil")
+	}
+
+	data, err := os.ReadFile(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "original" {
+		t.Errorf("file outside the extraction root was modified: got %q, want %q", data, "original")
+	}
+}
+
+// The containment check must not break the ordinary case where the workspace
+// itself lives under a symlink — /tmp -> /private/tmp on macOS is exactly this,
+// and a raw string comparison against destDir would reject every pull there.
+func TestUnzipFile_SymlinkedRootIsAllowed(t *testing.T) {
+	real := t.TempDir()
+	link := filepath.Join(t.TempDir(), "workspace")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	zipPath := makeZip(t, map[string]string{"sub/deep.txt": "content"})
+	if err := unzipFile(zipPath, link); err != nil {
+		t.Fatalf("extraction into a symlinked root should succeed, got %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(real, "sub", "deep.txt"))
+	if err != nil || string(data) != "content" {
+		t.Errorf("sub/deep.txt: got %q, err %v", data, err)
+	}
+}
+
 func TestUnzipFile_NotFound(t *testing.T) {
 	err := unzipFile("/nonexistent.zip", t.TempDir())
 	if err == nil {

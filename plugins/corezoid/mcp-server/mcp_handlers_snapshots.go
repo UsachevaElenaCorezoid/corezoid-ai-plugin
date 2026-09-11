@@ -11,19 +11,17 @@ import (
 
 // handleCreateSnapshot manually creates a snapshot for the given process.
 func handleCreateSnapshot(ctx context.Context, args map[string]interface{}) (string, bool) {
-	filePath, err := resolveProcessPath(args, "process_path")
-	if err != nil {
-		return "Error: " + err.Error(), true
-	}
-
-	procID, errMsg := extractProcessIDFromPath(filePath)
+	procID, filePath, errMsg := resolveProcessID(args, "process_path", "process_id")
 	if errMsg != "" {
 		return errMsg, true
 	}
 
 	title, _ := args["title"].(string)
 	if title == "" {
-		name := extractProcessNameFromPath(filePath)
+		name := fmt.Sprintf("process %d", procID)
+		if filePath != "" {
+			name = extractProcessNameFromPath(filePath)
+		}
 		title = fmt.Sprintf("manual snapshot %s %s", name, time.Now().UTC().Format("2006-01-02 15:04"))
 	}
 
@@ -31,6 +29,13 @@ func handleCreateSnapshot(ctx context.Context, args map[string]interface{}) (str
 	projectID, envNotice := resolveAndCacheProjectID(v)
 	if projectID == 0 {
 		return "Error: could not resolve project_id. Ensure stage_id is configured for this folder (run the 'login' tool).", true
+	}
+
+	// Environments without the snapshot feature must not be asked to create one:
+	// the probe answers from cache after the first call, so this costs nothing
+	// on installations that do support snapshots.
+	if !snapshotsSupported(v, procID, projectID, v.StageID) {
+		return snapshotUnsupportedMessage, true
 	}
 
 	objID, version, err := v.CreateSnapshot(procID, projectID, v.StageID, title)
@@ -47,12 +52,7 @@ func handleCreateSnapshot(ctx context.Context, args map[string]interface{}) (str
 
 // handleListSnapshots returns all snapshots for the given process.
 func handleListSnapshots(ctx context.Context, args map[string]interface{}) (string, bool) {
-	filePath, err := resolveProcessPath(args, "process_path")
-	if err != nil {
-		return "Error: " + err.Error(), true
-	}
-
-	procID, errMsg := extractProcessIDFromPath(filePath)
+	procID, _, errMsg := resolveProcessID(args, "process_path", "process_id")
 	if errMsg != "" {
 		return errMsg, true
 	}
@@ -61,6 +61,10 @@ func handleListSnapshots(ctx context.Context, args map[string]interface{}) (stri
 	projectID, _ := resolveAndCacheProjectID(v)
 	if projectID == 0 {
 		return "Error: could not resolve project_id.", true
+	}
+
+	if !snapshotsSupported(v, procID, projectID, v.StageID) {
+		return snapshotUnsupportedMessage, true
 	}
 
 	snapshots, err := v.ListSnapshots(procID, projectID, v.StageID)
@@ -78,12 +82,7 @@ func handleListSnapshots(ctx context.Context, args map[string]interface{}) (stri
 
 // handleDeleteSnapshot removes a snapshot by obj_id.
 func handleDeleteSnapshot(ctx context.Context, args map[string]interface{}) (string, bool) {
-	filePath, err := resolveProcessPath(args, "process_path")
-	if err != nil {
-		return "Error: " + err.Error(), true
-	}
-
-	procID, errMsg := extractProcessIDFromPath(filePath)
+	procID, _, errMsg := resolveProcessID(args, "process_path", "process_id")
 	if errMsg != "" {
 		return errMsg, true
 	}
@@ -97,6 +96,10 @@ func handleDeleteSnapshot(ctx context.Context, args map[string]interface{}) (str
 	projectID, _ := resolveAndCacheProjectID(v)
 	if projectID == 0 {
 		return "Error: could not resolve project_id.", true
+	}
+
+	if !snapshotsSupported(v, procID, projectID, v.StageID) {
+		return snapshotUnsupportedMessage, true
 	}
 
 	if err := v.DeleteSnapshot(objID, procID, projectID, v.StageID); err != nil {
@@ -108,12 +111,7 @@ func handleDeleteSnapshot(ctx context.Context, args map[string]interface{}) (str
 
 // handleGetSnapshot returns the nodes of a specific snapshot for diff comparison.
 func handleGetSnapshot(ctx context.Context, args map[string]interface{}) (string, bool) {
-	filePath, err := resolveProcessPath(args, "process_path")
-	if err != nil {
-		return "Error: " + err.Error(), true
-	}
-
-	procID, errMsg := extractProcessIDFromPath(filePath)
+	procID, _, errMsg := resolveProcessID(args, "process_path", "process_id")
 	if errMsg != "" {
 		return errMsg, true
 	}
@@ -127,6 +125,10 @@ func handleGetSnapshot(ctx context.Context, args map[string]interface{}) (string
 	projectID, _ := resolveAndCacheProjectID(v)
 	if projectID == 0 {
 		return "Error: could not resolve project_id.", true
+	}
+
+	if !snapshotsSupported(v, procID, projectID, v.StageID) {
+		return snapshotUnsupportedMessage, true
 	}
 
 	nodes, err := v.GetSnapshot(objID, procID, projectID, v.StageID)

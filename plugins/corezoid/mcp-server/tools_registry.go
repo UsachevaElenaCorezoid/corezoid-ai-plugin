@@ -44,6 +44,38 @@ func toolHints(readOnly, destructive, idempotent, openWorld bool) *toolAnnotatio
 	}
 }
 
+// processTargetAnyOf advertises the "identify the process by EXACTLY ONE of
+// process_path or process_id" contract shared by run-task and the snapshot
+// tools.
+//
+// It is anyOf, not oneOf, on purpose. JSON Schema `required` is satisfied by
+// the mere PRESENCE of a key, whatever its value, while the runtime check in
+// resolveProcessID treats "" and null as absent — deliberately, because some
+// MCP hosts serialize a declared-but-unset optional field instead of omitting
+// it (see TestResolveProcessID_EmptyOrNullProcessPathIsNotAConflict). Under
+// oneOf such a client sends {process_path: "", process_id: N}, satisfies BOTH
+// branches, and a host that pre-validates arguments against the advertised
+// schema rejects the call before the server ever sees it — breaking exactly
+// the no-local-repository hosts process_id was added for. anyOf still rejects
+// a call that names neither target, and the genuine both-given conflict is
+// caught by resolveProcessID, which can say which two arguments disagreed
+// instead of emitting a schema error. Same shape show-task already uses for
+// its task_id/ref pair.
+//
+// For the same reason the two properties are typed ["string", "null"] and
+// ["integer", "null"] at each call site: a host that fills an unset optional
+// with an explicit null would otherwise fail client-side validation on the
+// property TYPE even with anyOf in place, and the runtime accepts that form
+// too (TestResolveProcessID_NullProcessIDFallsBackToProcessPath). A null is
+// "not supplied", never a target — resolveProcessID still rejects a call that
+// nulls both.
+func processTargetAnyOf() []map[string]interface{} {
+	return []map[string]interface{}{
+		{"required": []string{"process_path"}},
+		{"required": []string{"process_id"}},
+	}
+}
+
 // toolRegistry is the single source of truth for all MCP tool definitions.
 // mcp_server.go returns this slice for "tools/list", and tests verify
 // the README tools table stays in sync with it.
@@ -184,7 +216,7 @@ var toolRegistry = []mcpTool{
 	},
 	{
 		Name:        "push-process",
-		Description: "Validate and deploy a process file to Corezoid. Runs lint-process first and blocks deploy-breaking findings; advisory findings do not block. Also blocks when the process changed on the server since pull, reporting local edits, server changes, true overlap, and the last known author. Resolve by re-pulling; or merge=true to write a reviewable local 3-way merge plus a .pre-merge backup without deploying; or force=true to overwrite only after accepting the risk. A pre-push server snapshot is always attempted for existing processes and if the snapshot API fails the push is blocked (retry once the API recovers). If the server-state fetch fails for any reason other than a genuine 'not found', the push is also blocked — the same API is about to be called by the deploy itself. Active Call Process Stub Mode (obj_type:4) is warning-only on a resolved mutable non-production-like stage, while immutable/prod/unknown stages require allow_active_stub_mode=true after explicit confirmation. force=true does not confirm Stub Mode. force=true also does NOT bypass structural lint findings (broken links, old-format nodes, self-referencing api_copy/api_rpc) — those describe an invalid graph the server rejects and must be fixed in the process design. The server regenerates node IDs and rewrites the local file with the canonical scheme, so reference nodes by title and re-read the file after push.",
+		Description: "Validate and deploy a process file to Corezoid. Runs lint-process first and blocks deploy-breaking findings; advisory findings do not block. Also blocks when the process changed on the server since pull, reporting local edits, server changes, true overlap, and the last known author. Resolve by re-pulling; or merge=true to write a reviewable local 3-way merge plus a .pre-merge backup without deploying; or overwrite_server_change=true to overwrite only after being shown the report. force=true is the generic-lint override ONLY: it never waives the concurrency gate (so a force set for a lint finding can never pre-authorise dropping a concurrent change nobody has seen), never confirms Stub Mode, and never bypasses structural lint findings (broken links, old-format nodes, self-referencing api_copy/api_rpc) — those describe an invalid graph the server rejects and must be fixed in the process design. A pre-push server snapshot is always attempted for existing processes. Overwriting live state that was never compared (overwrite_server_change or adopt_existing) with no snapshot, or pushing when the snapshot call itself failed, is refused unless allow_no_snapshot=true is passed AND the stage resolves as mutable and non-production-like: that combination is irreversible, so the flag is ignored on immutable, production-like or unresolvable stages, including installations whose API has no snapshot object at all (retrying once the API recovers is the safer default). A never-deployed process is exempt — it has no version to lose. Every waived gate is reported in the push result, not only in the server log. If the server-state fetch fails for any reason other than a genuine 'not found', the push is also blocked — the same API is about to be called by the deploy itself. Active Call Process Stub Mode (obj_type:4) is warning-only on a resolved mutable non-production-like stage, while immutable/prod/unknown stages require allow_active_stub_mode=true after explicit confirmation. The server regenerates node IDs and rewrites the local file with the canonical scheme, so reference nodes by title and re-read the file after push.",
 		Annotations: toolHints(hintMutates, hintDestructive, hintNonIdempotent, hintOpenWorld),
 		InputSchema: map[string]interface{}{
 			"type": "object",
@@ -195,7 +227,11 @@ var toolRegistry = []mcpTool{
 				},
 				"force": map[string]interface{}{
 					"type":        "boolean",
-					"description": "Deploy despite generic blocking lint findings or overwrite a concurrent server change. Does not confirm active Stub Mode; use allow_active_stub_mode for that. Advisory findings never block. Does NOT bypass pre-deployment validation errors such as self-referencing api_copy/api_rpc nodes — those must be fixed in the process design. Default false.",
+					"description": "Deploy despite generic blocking lint findings. LINT ONLY: it does not overwrite a concurrent server change (use overwrite_server_change), does not confirm active Stub Mode (use allow_active_stub_mode) and does not waive the snapshot requirement (use allow_no_snapshot). Advisory findings never block. Does NOT bypass pre-deployment validation errors such as self-referencing api_copy/api_rpc nodes — those must be fixed in the process design. Default false.",
+				},
+				"overwrite_server_change": map[string]interface{}{
+					"type":        "boolean",
+					"description": "Deploy over a process that changed on the server since your pull, dropping those server changes. Pass it only in reply to the block report that describes what would be lost — never speculatively, and never as a default: set ahead of time it authorises overwriting a concurrent change that has not happened yet and that nobody will ever see. Separate from force on purpose: force overrides lint findings, this one overrides another person's edit. Refused when no pre-push snapshot exists unless allow_no_snapshot=true is passed too (a never-deployed process is exempt). Default false.",
 				},
 				"allow_active_stub_mode": map[string]interface{}{
 					"type":        "boolean",
@@ -204,6 +240,14 @@ var toolRegistry = []mcpTool{
 				"merge": map[string]interface{}{
 					"type":        "boolean",
 					"description": "On a concurrent-change conflict, perform a 3-way merge: preserve the original as <process>.pre-merge and graft non-conflicting server node/process-field changes into the local file for review (does not deploy). Values changed differently on both sides are kept as yours and listed to resolve. Default false.",
+				},
+				"allow_no_snapshot": map[string]interface{}{
+					"type":        "boolean",
+					"description": "Deploy over an existing process even though no pre-push snapshot could be taken — either because project_id/stage_id could not be resolved, or because the CreateSnapshot API call itself failed (e.g. a transient platform error) — i.e. accept that the overwritten version cannot be restored. Honoured ONLY on a stage that resolves and is mutable; refused on immutable, production-like or unresolvable stages. Separate from force and overwrite_server_change on purpose: those override findings or a shown conflict, this waives the ability to undo. Passing it together with overwrite_server_change or adopt_existing is the explicit, deliberate way to make an irreversible overwrite. Prefer fixing the workspace configuration (corezoid-init) or retrying once the API recovers. Default false.",
+				},
+				"adopt_existing": map[string]interface{}{
+					"type":        "boolean",
+					"description": "Deploy a file that has no pull baseline over a process that already has a deployed version — overwriting server state without knowing what it contains. Use only when the local file is deliberately authoritative (an import or a restored copy); otherwise run pull-process first so real conflicts can be detected. Not needed for processes that were never deployed. Separate from force and from overwrite_server_change on purpose: those resolve a conflict you were shown, this one declares you do not know what is on the server. Refused when no pre-push snapshot exists unless allow_no_snapshot=true is passed too (a never-deployed process is exempt). Default false.",
 				},
 			},
 			"required": []string{"process_path"},
@@ -249,7 +293,7 @@ var toolRegistry = []mcpTool{
 	},
 	{
 		Name:        "clean-process",
-		Description: "Remove inactive nodes from a Corezoid process and save the result as a reviewable proposal named <ID>_<title>.cleaned.json (deliberately NOT a .conv.json, so it does not collide with the pulled process in path auto-discovery or the git-sync index; pass its path explicitly to lint-process/push-process when you want to deploy it). Fetches per-node time-series statistics for the last N days (default 90), classifies nodes as active or inactive, protects structurally important inactive nodes (escalation chains, unconditional-go targets, set_param targets), then removes inactive nodes iteratively: dangling references are redirected to the removed node's go-successor, newly empty condition nodes cascade, pass-through nodes (single unconditional go after conditional branches were removed) are merged with their targets, and delay→final nodes this cleanup rewired are removed (hand-authored delay nodes are left alone). Validates the cleaned scheme for dangling references and empty condition nodes, and writes nothing if validation fails. Reports node counts before/after, breakdown by removal step, and warnings for any outgoing branch that could not be redirected.",
+		Description: "Remove nodes with no traffic in the last N days (default 90) from a Corezoid process, saving a reviewable proposal as <ID>_<title>.cleaned.json — NOT a .conv.json, so it never collides with the pulled process; pass that path explicitly to lint-process/push-process to deploy it. Never deploys. Structurally required inactive nodes are kept (escalation chains, unconditional-go and set_param targets), references to removed nodes are redirected to their go-successor, and only delay→final nodes this cleanup rewired are dropped — hand-authored delays stay. Refuses to write if no node shows traffic, if the start node would be lost, or if the result fails validation. Reports counts per step plus any outgoing branch that could not be redirected.",
 		Annotations: toolHints(hintMutates, hintSafe, hintIdempotent, hintOpenWorld),
 		InputSchema: map[string]interface{}{
 			"type": "object",
@@ -272,14 +316,18 @@ var toolRegistry = []mcpTool{
 	},
 	{
 		Name:        "run-task",
-		Description: "Run a task on an already-deployed Corezoid process (without re-deploying) and wait for it to reach a final node. Never commits or deploys, so it needs only run access and works on immutable stages; if the deployed node list is unreadable the task is still sent, just reported without node names. Polls up to wait_sec (default 30), so tasks that cross async nodes (api, api_rpc, db_call, delay) still return their final result. On timeout reports the node the task is parked at, plus TaskRef/TaskID for follow-up via list-task-history.",
+		Description: "Run a task on an already-deployed Corezoid process (without re-deploying) and wait for it to reach a final node. Never commits or deploys, so it needs only run access and works on immutable stages; if the deployed node list is unreadable the task is still sent, just reported without node names. Identify the target with EXACTLY ONE of process_path (a local .conv.json file) or process_id (the numeric Corezoid process ID, same as show-task/list-task-history) — process_id needs no local file at all, so this also works in hosts with no local process repository (no pull-process required); passing both is rejected as ambiguous. Polls up to wait_sec (default 30), so tasks that cross async nodes (api, api_rpc, db_call, delay) still return their final result. On timeout reports the node the task is parked at, plus TaskRef/TaskID for follow-up via list-task-history.",
 		Annotations: toolHints(hintMutates, hintSafe, hintNonIdempotent, hintOpenWorld),
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"process_path": map[string]interface{}{
-					"type":        "string",
-					"description": "Relative path to the process JSON file.",
+					"type":        []string{"string", "null"},
+					"description": "Relative path to the process JSON file. Omit and pass process_id instead when there is no local process repository (e.g. a host console with no filesystem). Mutually exclusive with process_id.",
+				},
+				"process_id": map[string]interface{}{
+					"type":        []string{"integer", "null"},
+					"description": "Corezoid process (conv) ID, greater than zero. Alternative to process_path — use this to run a task without a local .conv.json file, without a preceding pull-process. Mutually exclusive with process_path.",
 				},
 				"data": map[string]interface{}{
 					"type":        "string",
@@ -294,7 +342,8 @@ var toolRegistry = []mcpTool{
 					"description": "How long to wait (seconds) for the task to reach a final node before reporting it as in progress. Default 30, max 600. Raise it for processes with slow external calls or delay nodes.",
 				},
 			},
-			"required": []string{"process_path", "data"},
+			"required": []string{"data"},
+			"anyOf":    processTargetAnyOf(),
 		},
 	},
 	{
@@ -826,6 +875,57 @@ var toolRegistry = []mcpTool{
 		},
 	},
 	{
+		Name:        "create-communications-orchestrator",
+		Description: "Create a Communications Orchestrator: a multi-platform robot handling Telegram, Facebook Messenger, Viber and Apple Messages for Business. Corezoid builds one folder of processes per channel asynchronously; this tool queues the build and polls it (every 3s, up to 10 checks), returning the generated folder_url or the wizard's error. At least one messenger is required. NO UNDO (~150 processes; a rebuild on a live channel token steals that bot's webhook): apply=false (default) returns a dry-run carrying the confirm token needed to build.",
+		// destructiveHint, even though the build only ADDS objects: the flag is
+		// what an MCP host reads to decide whether to ask the user first, and
+		// this call earns the prompt twice over: there is no undo for the ~150
+		// processes it creates, and a second build against a channel token that
+		// already serves a bot silently steals that bot's webhook — destroying
+		// a working integration without deleting a single object.
+		//
+		// The annotation is advice to the host, not a check, so the handler also
+		// demands the apply/confirm handshake the other irreversible tools use.
+		// The corezoid-gen-bot skill has its own confirmation step, but the tool
+		// is callable without the skill, and that path previously had no
+		// server-side gate at all.
+		Annotations: toolHints(hintMutates, hintDestructive, hintNonIdempotent, hintOpenWorld),
+		InputSchema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"messengers": map[string]interface{}{
+					"type": "string",
+					"description": "JSON array of channel objects, at least one. One entry per channel with its own credential field: " +
+						`telegram {"channel":"telegram","key":"<bot token>"}, ` +
+						`viber {"channel":"viber","viber_token":"<token>"}, ` +
+						`fbmessenger {"channel":"fbmessenger","page_access_token":"<token>"}, ` +
+						`abc {"channel":"abc","abc_token":"<token>","user_id":68381,"email":"me@example.com","name":"My Name"} — abc = Apple Messages for Business; user_id/email/name are an optional brand contact.`,
+				},
+				"stage_id": map[string]interface{}{
+					"type":        "integer",
+					"description": "Optional. Stage/folder ID to build in. Defaults to the current stage (from the <id>_<name>.stage.json marker).",
+				},
+				"project_id": map[string]interface{}{
+					"type":        "integer",
+					"description": "Optional. Project ID owning stage_id. Resolved from the stage when omitted.",
+				},
+				"lang": map[string]interface{}{
+					"type":        "string",
+					"description": "Optional. Language of generated processes and bot replies (e.g. \"en\", \"uk\", \"ru\"). Default \"en\".",
+				},
+				"apply": map[string]interface{}{
+					"type":        "boolean",
+					"description": "false (default) = preview only, nothing is created. true = build (also requires confirm).",
+				},
+				"confirm": map[string]interface{}{
+					"type":        "string",
+					"description": "Required when apply=true. Copy the exact token printed by the apply=false dry-run.",
+				},
+			},
+			"required": []string{"messengers"},
+		},
+	},
+	{
 		Name:        "create-dashboard",
 		Description: "Create a new Corezoid dashboard for visualizing process node metrics. Returns dashboard_id needed for adding charts.",
 		Annotations: toolHints(hintMutates, hintSafe, hintNonIdempotent, hintOpenWorld),
@@ -989,14 +1089,20 @@ var toolRegistry = []mcpTool{
 				},
 				"task_id": map[string]interface{}{
 					"type":        "string",
+					"minLength":   1,
 					"description": "Task ID (obj_id)",
 				},
 				"ref": map[string]interface{}{
 					"type":        "string",
+					"minLength":   1,
 					"description": "Task reference string",
 				},
 			},
 			"required": []string{"process_id"},
+			"anyOf": []map[string]interface{}{
+				{"required": []string{"task_id"}},
+				{"required": []string{"ref"}},
+			},
 		},
 	},
 	{
@@ -1473,74 +1579,92 @@ var toolRegistry = []mcpTool{
 	},
 	{
 		Name:        "create-snapshot",
-		Description: "Create a snapshot of the current server state of a process before making changes. Useful as a manual checkpoint before experiments. Auto-snapshot is also created automatically before every push-process on existing processes.",
+		Description: "Create a snapshot of the current server state of a process before making changes. Useful as a manual checkpoint before experiments. Auto-snapshot is also created automatically before every push-process on existing processes. Identify the target with EXACTLY ONE of process_path (a local .conv.json file) or process_id (the numeric Corezoid process ID) — process_id works with no local process repository; passing both is rejected as ambiguous.",
 		Annotations: toolHints(hintMutates, hintSafe, hintNonIdempotent, hintOpenWorld),
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"process_path": map[string]interface{}{
-					"type":        "string",
-					"description": "Path to the .conv.json file.",
+					"type":        []string{"string", "null"},
+					"description": "Path to the .conv.json file. Omit and pass process_id instead when there is no local process repository. Mutually exclusive with process_id.",
+				},
+				"process_id": map[string]interface{}{
+					"type":        []string{"integer", "null"},
+					"description": "Corezoid process (conv) ID, greater than zero. Alternative to process_path — works with no local file. Mutually exclusive with process_path.",
 				},
 				"title": map[string]interface{}{
 					"type":        "string",
 					"description": "Optional snapshot title. Defaults to 'manual snapshot <ProcessName> <datetime>'.",
 				},
 			},
-			"required": []string{"process_path"},
+			"anyOf": processTargetAnyOf(),
 		},
 	},
 	{
 		Name:        "list-snapshots",
-		Description: "List all snapshots for a process. Returns version, title, author and creation time for each snapshot.",
+		Description: "List all snapshots for a process. Returns version, title, author and creation time for each snapshot. Identify the target with EXACTLY ONE of process_path (a local .conv.json file) or process_id (the numeric Corezoid process ID) — process_id works with no local process repository; passing both is rejected as ambiguous.",
 		Annotations: toolHints(hintReadOnly, hintSafe, hintIdempotent, hintOpenWorld),
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"process_path": map[string]interface{}{
-					"type":        "string",
-					"description": "Path to the .conv.json file.",
+					"type":        []string{"string", "null"},
+					"description": "Path to the .conv.json file. Omit and pass process_id instead when there is no local process repository. Mutually exclusive with process_id.",
+				},
+				"process_id": map[string]interface{}{
+					"type":        []string{"integer", "null"},
+					"description": "Corezoid process (conv) ID, greater than zero. Alternative to process_path — works with no local file. Mutually exclusive with process_path.",
 				},
 			},
-			"required": []string{"process_path"},
+			"anyOf": processTargetAnyOf(),
 		},
 	},
 	{
 		Name:        "delete-snapshot",
-		Description: "Delete a snapshot by its obj_id. Use list-snapshots to find the snapshot_id.",
+		Description: "Delete a snapshot by its obj_id. Use list-snapshots to find the snapshot_id. Identify the target with EXACTLY ONE of process_path (a local .conv.json file) or process_id (the numeric Corezoid process ID) — process_id works with no local process repository; passing both is rejected as ambiguous.",
 		Annotations: toolHints(hintMutates, hintDestructive, hintNonIdempotent, hintOpenWorld),
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"process_path": map[string]interface{}{
-					"type":        "string",
-					"description": "Path to the .conv.json file.",
+					"type":        []string{"string", "null"},
+					"description": "Path to the .conv.json file. Omit and pass process_id instead when there is no local process repository. Mutually exclusive with process_id.",
+				},
+				"process_id": map[string]interface{}{
+					"type":        []string{"integer", "null"},
+					"description": "Corezoid process (conv) ID, greater than zero. Alternative to process_path — works with no local file. Mutually exclusive with process_path.",
 				},
 				"snapshot_id": map[string]interface{}{
 					"type":        "integer",
 					"description": "The obj_id of the snapshot to delete (from list-snapshots).",
 				},
 			},
-			"required": []string{"process_path", "snapshot_id"},
+			"required": []string{"snapshot_id"},
+			"anyOf":    processTargetAnyOf(),
 		},
 	},
 	{
 		Name:        "get-snapshot",
-		Description: "Get the node list of a specific snapshot for diff comparison against the current process state. Returns all nodes as they existed at snapshot time.",
+		Description: "Get the node list of a specific snapshot for diff comparison against the current process state. Returns all nodes as they existed at snapshot time. Identify the target with EXACTLY ONE of process_path (a local .conv.json file) or process_id (the numeric Corezoid process ID) — process_id works with no local process repository; passing both is rejected as ambiguous.",
 		Annotations: toolHints(hintReadOnly, hintSafe, hintIdempotent, hintOpenWorld),
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"process_path": map[string]interface{}{
-					"type":        "string",
-					"description": "Path to the .conv.json file.",
+					"type":        []string{"string", "null"},
+					"description": "Path to the .conv.json file. Omit and pass process_id instead when there is no local process repository. Mutually exclusive with process_id.",
+				},
+				"process_id": map[string]interface{}{
+					"type":        []string{"integer", "null"},
+					"description": "Corezoid process (conv) ID, greater than zero. Alternative to process_path — works with no local file. Mutually exclusive with process_path.",
 				},
 				"snapshot_id": map[string]interface{}{
 					"type":        "integer",
 					"description": "The obj_id of the snapshot to retrieve (from list-snapshots).",
 				},
 			},
-			"required": []string{"process_path", "snapshot_id"},
+			"required": []string{"snapshot_id"},
+			"anyOf":    processTargetAnyOf(),
 		},
 	},
 

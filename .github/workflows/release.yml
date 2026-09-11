@@ -6,11 +6,25 @@ on:
       - "v*"
 
 jobs:
+  full-ci:
+    name: Full CI
+    uses: ./.github/workflows/ci.yml
+
   guard:
-    name: Pre-release gate (version sync + tests)
+    name: Pre-release gate (version sync + immutable release)
+    needs: full-ci
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+
+      - name: Reject an existing release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "ERROR: release $GITHUB_REF_NAME already exists; publish a new immutable version instead."
+            exit 1
+          fi
 
       - name: Parse JSON manifests
         run: |
@@ -81,16 +95,6 @@ jobs:
           print(f"All six manifests match tag {tag!r}: {claude_ver}")
           EOF
 
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: plugins/corezoid/mcp-server/go.mod
-          cache: true
-          cache-dependency-path: plugins/corezoid/mcp-server/go.sum
-
-      - name: MCP server tests
-        working-directory: plugins/corezoid/mcp-server
-        run: go test -race ./...
-
   build-binaries:
     name: Build MCP server binaries
     needs: guard
@@ -108,13 +112,14 @@ jobs:
         working-directory: plugins/corezoid/mcp-server
         env:
           VERSION: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
         run: |
           for GOOS in darwin linux windows; do
             for GOARCH in amd64 arm64; do
               EXT=""
               if [ "$GOOS" = "windows" ]; then EXT=".exe"; fi
               CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH \
-                go build -ldflags="-s -w -X main.Version=${VERSION}" -o "convctl-${GOOS}-${GOARCH}${EXT}" .
+                go build -ldflags="-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT}" -o "convctl-${GOOS}-${GOARCH}${EXT}" .
             done
           done
 
@@ -185,3 +190,36 @@ jobs:
             public/llms.txt
             public/.well-known/skills/index.json
             POWER.md
+
+      # A release that publishes without its binaries is not a soft failure: the
+      # launcher (plugins/corezoid/mcp-server/run.sh) downloads
+      # convctl-<os>-<arch> and checksums.txt from exactly this release, and
+      # otherwise falls back to `go run .`, which needs the Go toolchain the
+      # README says is not required. So
+      # the published asset list is verified against the expected set here, and
+      # a release missing anything fails the workflow loudly instead of sitting
+      # there looking complete.
+      - name: Verify published release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          expected="convctl-darwin-amd64 convctl-darwin-arm64 \
+                    convctl-linux-amd64 convctl-linux-arm64 \
+                    convctl-windows-amd64.exe convctl-windows-arm64.exe \
+                    checksums.txt llms.txt index.json POWER.md"
+          actual=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+                     --json assets --jq '.assets[].name')
+          echo "Published assets:"; echo "$actual" | sed 's/^/  /'
+          missing=""
+          for asset in $expected; do
+            if ! printf '%s\n' "$actual" | grep -Fxq "$asset"; then
+              missing="$missing $asset"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "ERROR: release $GITHUB_REF_NAME is missing:$missing"
+            echo "The launcher cannot install from this release. Fix the build and publish a new version."
+            exit 1
+          fi
+          echo "All expected assets present."

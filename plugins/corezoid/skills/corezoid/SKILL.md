@@ -26,7 +26,7 @@ You have access to the Corezoid API via the `corezoid` MCP server.
 | `push-process` | Validate and deploy a `.conv.json` file |
 | `lint-process` | Validate process structure locally (no API needed) |
 | `layout-process` | Auto-arrange node coordinates into a clean layout (local; only x/y and collapse flags change) |
-| `run-task` | Run a task on an already-deployed process |
+| `run-task` | Run a task on an already-deployed process, by `process_path` or `process_id` — `process_id` needs no local file, so it also works in hosts with no local process repository (no `pull-process` required) |
 | `show-task` | Look up one task by `ref` and/or `task_id` — returns its current `data`, `node_id` and status. Read-only; use it instead of paging `list-node-tasks` |
 | `create-process` | Create a new empty process (`conv_type: "process"`) in a folder |
 | `create-state-diagram` | Create a new empty state diagram (`conv_type: "state"`) in a folder |
@@ -35,6 +35,7 @@ You have access to the Corezoid API via the `corezoid` MCP server.
 | `move-process` / `move-folder` | Explicitly reparent an existing object without copying/deploying; dry-run + exact confirmation required |
 | `create-alias` | Create a short alias for a process |
 | `create-variable` | Create a Corezoid environment variable |
+| `create-communications-orchestrator` | Build a multi-platform messenger robot (Telegram / Facebook Messenger / Viber / Apple Messages for Business). Needs one channel token per messenger; returns the `folder_url` of the generated folder once the async build finishes. Two calls: `apply=false` previews and prints a confirm token, `apply=true` + that token builds |
 | `create-dashboard` | Create a new dashboard for process metrics |
 | `get-dashboard` | Get dashboard details with charts and series |
 | `add-chart` | Add a chart (column/pie/funnel/table) to a dashboard |
@@ -53,7 +54,7 @@ You have access to the Corezoid API via the `corezoid` MCP server.
 | `list-api-keys` | List API keys in the workspace |
 | `find-principal` | Resolve user / group / API-key name → obj_id (call before share-object) |
 | `invite-user` | Invite an external email AND share an object in one call |
-| `create-snapshot` | Create a snapshot of a process (auto-created before every push-process on existing processes) |
+| `create-snapshot` | Create a snapshot of a process (auto-created before every push-process on existing processes; skipped where the environment has no snapshot support) |
 | `list-snapshots` | List all snapshots for a process |
 | `delete-snapshot` | Delete a snapshot by snapshot_id |
 | `get-snapshot` | Get snapshot node list for diff comparison against current process |
@@ -119,6 +120,12 @@ push-process(process_path="./folder/12345_MyProcess.conv.json")
 run-task(process_path="./folder/12345_MyProcess.conv.json", data={"key": "value"})
 ```
 
+### Run a task with no local process file (e.g. a host with no local process repository)
+```
+run-task(process_id=12345, data={"key": "value"})
+```
+`process_id` needs no `pull-process` first — it identifies the process the same way `process_path`'s filename does, just without a file (same argument name `show-task`/`list-task-history`/`pull-process` already use). `create-snapshot`, `list-snapshots`, `delete-snapshot`, and `get-snapshot` accept `process_id` the same way. Pass exactly one of the two — both together is rejected as ambiguous, and `process_id` must be greater than zero. These tools still need `stage_id`/`project_id` resolved from Corezoid credentials (`login`, or `COREZOID_*` env vars — see `corezoid-init`), even when no local file is used.
+
 ### Inspect a task by its external reference
 ```
 show-task(process_id=12345678, ref="ORDER-4711")
@@ -156,6 +163,8 @@ For domain-specific workflows use the specialized skills:
 - `/corezoid-retro` — end-of-session retrospective: extract learnings (failed→fixed push deltas, data-shape surprises, corrections) and route them to workspace CLAUDE.md, team feedback, settings, or personal memory with user confirmation
 - `/corezoid-describe` — update or create the description of a process, folder, or project without editing its logic
 - `/corezoid-git-context` — after a substantial session: analyse changes and update `_ext/docs/*.md` in the git mirror
+- `/corezoid-gen-bot` — turn a set of existing processes into a multi-platform messenger bot (Telegram / Viber / Facebook Messenger / Apple Messages for Business): derives each process's real contract, designs the command map, creates the Communications Orchestrator and one bot process per command
+- `/corezoid-edit-bot` — change a bot that already exists: add/rename/drop a command, wire another process, edit copy or keyboards, promote a stage
 
 ## Reference Documents
 

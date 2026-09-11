@@ -1,7 +1,7 @@
 ---
 name: corezoid
 displayName: Corezoid
-version: 3.1.3
+version: 3.4.0
 description: Corezoid BPM platform assistant. Exposes the Corezoid REST API as MCP tools (`convctl`) plus 24 skills covering process creation, editing, lifecycle operations, review, validation, dashboards, state diagrams, variables, access, layout, docs, and custom-code git_call. Ships JSON schemas and per-node-type documentation for all 24 Corezoid node types.
 author:
   name: Corezoid
@@ -89,6 +89,7 @@ Each skill is auto-loaded from `.kiro/skills/<name>/SKILL.md`:
 - `corezoid-lifecycle` — confirm-gated process pause/resume and process/folder moves.
 - `corezoid-review` / `corezoid-project-review` — single-process / whole-project audits.
 - `corezoid-state-diagram-create` / `corezoid-state-diagram-edit` — state-machine processes.
+- `corezoid-gen-bot` / `corezoid-edit-bot` — generate and edit a multi-platform messenger bot over existing processes.
 - `corezoid-process-optimizer` — tact reduction, resilience patterns.
 - `corezoid-process-tech-writer` — generate human-readable docs.
 - `corezoid-node-layout` — auto-arrange node x/y (positions only) before push.

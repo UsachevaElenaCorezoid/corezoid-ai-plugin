@@ -18,6 +18,8 @@ The plugin bundles a Go MCP server that exposes Corezoid operations as MCP tools
 | `corezoid-lifecycle`           | "pause/resume process", "move process/folder", "сними с паузы", "перемести процесс" | Explicit, confirm-gated process lifecycle and server-side reparenting |
 | `corezoid-state-diagram-create` | "create state diagram", "build a state machine", "conv_type state" | Building state diagrams from scratch (`conv_type: "state"`) |
 | `corezoid-state-diagram-edit`  | "edit state diagram", "add a state", "change transitions" | Modifying existing state diagrams — states, transitions, side effects |
+| `corezoid-gen-bot`             | "сделай бота из этих процессов", "telegram bot from corezoid processes", "communications orchestrator" | Generate a Telegram / Viber / Apple Messages / Facebook Messenger bot over a set of existing processes — plan, execute, refresh |
+| `corezoid-edit-bot`            | "измени бота", "добавь команду", "edit bot", "задеплой бота" | Edit an already-built bot: commands, copy, wiring, localization, stage promotion |
 | `corezoid-review`              | "review", "audit", "check" a process     | Analysis, dead code, best-practice violations     |
 | `corezoid-project-review`      | "review project", "audit folder"         | Cross-process audit of an entire folder           |
 | `corezoid-node-layout`         | "arrange nodes", "lay out", "tidy up the diagram", "fix positions", "remove overlaps" | Auto-arrange node x/y into a clean top-to-bottom flow with error handling railed right and no overlaps (positions only) |
@@ -167,12 +169,49 @@ They are saved to the current Folder in the same `~/.corezoid/config.json`.
 | Environment variable       | Required | Description                                       |
 |----------------------------|----------|---------------------------------------------------|
 | `COREZOID_WORK_DIR`        | No       | Absolute path used to pick which entry in `folders[]` applies. Set automatically by Claude Code / Codex / Kiro from the user's cwd. Only meaningful if the host cannot preserve cwd across MCP subprocess spawn. |
-| `COREZOID_APIGW_URL`       | No       | Override the API Gateway URL                      |
 | `COREZOID_OAUTH_CLIENT_ID` | No       | OAuth2 client ID — on-prem deployments with a custom authorization server should set this to their own client ID; cloud (account.corezoid.com) users do not need it |
-| `COREZOID_HTTP_PORT`       | No       | Activate the Streamable HTTP transport on this port (e.g. `8080`). When set the server listens for MCP over HTTP instead of stdio — intended for hosted marketplace deployments. Credentials must be pre-configured in `~/.corezoid/config.json`; the browser OAuth login flow is not available in HTTP mode. |
+| `COREZOID_HTTP_PORT`       | No       | Activate the Streamable HTTP transport on this port (e.g. `8080`). When set the server listens for MCP over HTTP instead of stdio — intended for hosted marketplace deployments. The browser OAuth login flow is not available in HTTP mode, so credentials must come from `~/.corezoid/config.json` or from the environment fallback below. |
+| `COREZOID_HTTP_TOKEN`      | No       | Bearer token required on every request when the HTTP transport is active. Unset does **not** disable authentication: the server mints a random token at startup and prints it to stderr for you to copy into your client config. Set this to keep the same token across restarts. |
+| `COREZOID_HTTP_ALLOWED_ORIGINS` | No  | Comma-separated `Origin` allowlist for the HTTP transport |
 | `COREZOID_AUTOLAYOUT`      | No       | Set to `off` to disable auto-placement of new `(0,0)` nodes on `push-process` (default: preserve) |
+| `COREZOID_WS_URL`          | No       | Override the build WebSocket endpoint used by `git_call` compilation (on-prem installs) |
+| `COREZOID_INSECURE_TLS`    | No       | Set to `1` to skip TLS verification — on-prem installs with self-signed certificates only |
+| `COREZOID_DEBUG`           | No       | Set to `1` for verbose API request/response tracing |
+| `COREZOID_DEBUG_LOG`       | No       | Path for the MCP-mode log file (default `~/.corezoid/mcp.log`) |
 
-All auth-related values (`account_url`, `workspace_id`, `stage_id`, `access_token`, `api_login`, `api_secret`, `git_url`, ...) live in `~/.corezoid/config.json` — not in environment variables.
+### Auth config from environment variables
+
+Normally every auth value lives in `~/.corezoid/config.json`, written by the `login` tool. For hosts that cannot run the interactive browser login and have no writable config — CI jobs, containers, the Streamable HTTP transport — the same fields can be supplied through the environment:
+
+| Environment variable        | Folder field     |
+|----------------------------|------------------|
+| `COREZOID_ACCOUNT_URL`     | `account_url`    |
+| `COREZOID_API_URL`         | `corezoid_url` (base URL only, no `/api/2/json` suffix) |
+| `COREZOID_APIGW_URL`       | `apigw_url` (default `https://api-apigw.corezoid.com`) |
+| `COREZOID_WORKSPACE_ID`    | `workspace_id`   |
+| `COREZOID_PROJECT_ID`      | `project_id`     |
+| `COREZOID_STAGE_ID`        | `stage_id`       |
+| `COREZOID_ACCESS_TOKEN`    | `access_token`   |
+| `COREZOID_TOKEN_EXPIRES_AT`| `expires_at` (RFC 3339; omit for a token with no known expiry) |
+| `COREZOID_API_LOGIN`       | `api_login`      |
+| `COREZOID_API_SECRET`      | `api_secret`     |
+| `COREZOID_GIT_URL`         | `git_url`        |
+| `COREZOID_GIT_STAGE_PATH`  | `git_stage_path` |
+
+Precedence rules:
+
+- **The config file wins, field by field.** A variable is used only where the `folders[]` entry matching the current working directory leaves that field empty — or when no entry matches at all.
+- **Credential pairs are merged as a unit, not field by field.** `COREZOID_API_LOGIN` and `COREZOID_API_SECRET` are taken together or not at all: Corezoid verifies the request signature against the secret belonging to that login, so a login from the config combined with a secret from the environment can never authenticate — it would only produce an opaque `401`. Half a pair is refused locally and the reason is reported in the next auth error. `COREZOID_ACCESS_TOKEN` and `COREZOID_TOKEN_EXPIRES_AT` are paired the same way, so a fresh token never inherits a stale expiry.
+- A **stored token that has already expired counts as missing**, so `COREZOID_ACCESS_TOKEN` takes over instead of leaving the server with no credentials.
+- **A rejected variable is reported, not silently dropped.** A malformed `*_ID` / `*_EXPIRES_AT`, or half an API-key pair, is named in the auth error the tool returns — so "not authenticated" cannot be mistaken for "never configured".
+- Environment values are **never written back** to `~/.corezoid/config.json` — an env-supplied field is used in memory only. The server still writes the caches it resolves itself (`project_id`, `git_url`, `git_stage_path`), as it does in a normal setup.
+- `logout` cannot remove them — unset the variables to fully deauthenticate.
+- A minimal working set is `COREZOID_ACCOUNT_URL` + `COREZOID_STAGE_ID` + either `COREZOID_ACCESS_TOKEN` or `COREZOID_API_LOGIN` + `COREZOID_API_SECRET`. Add `COREZOID_API_URL` to skip API-URL discovery.
+- **API-URL discovery runs on the first authenticated operation**, not at startup: with a token the API base URL is read from the account's clients endpoint; with API-key credentials — which that endpoint does not accept — it falls back to `COREZOID_ACCOUNT_URL`. Set `COREZOID_API_URL` explicitly when the API is not served from the account host, or when the account host is unreachable from where the server runs.
+
+In Claude Code / Codex these can be set in the `env` block of the `corezoid` server in your MCP config, or exported in the shell that launches the client.
+
+⚠️ `COREZOID_ACCESS_TOKEN` and `COREZOID_API_SECRET` are secrets. Prefer your CI's secret store over a committed config file — `~/.corezoid/config.json` is written with mode `0600`, an environment variable inherits whatever protection the host gives it.
 
 ## Telemetry
 
@@ -235,6 +274,8 @@ validation errors, and summarize what each process does.
 
 ## MCP Tools
 
+Most tools identify a process with `process_path` (a local `.conv.json` file, as produced by `pull-process`/`pull-folder`). A few tools that never need the file's *contents* — only the numeric process ID encoded in its filename — also accept a `process_id` argument instead (the same argument name `show-task`, `list-task-history`, `pull-process`, and other process-by-ID tools already use): `run-task`, `create-snapshot`, `list-snapshots`, `delete-snapshot`, `get-snapshot`. Pass exactly one of `process_path` or `process_id` — passing both, neither, or a `process_id` ≤ 0 is rejected with an error naming the valid options. `process_id` is what lets these tools run without a preceding `pull-process`, which is the only option in a host with no local process repository (e.g. the Simulator.Company AI console); `process_path` keeps working unchanged. Note that `process_id` alone doesn't remove all local state: these tools still need `stage_id`/`project_id` resolved from Corezoid credentials — see [Auth config from environment variables](#auth-config-from-environment-variables) for configuring that without an interactive `login`.
+
 | Tool                | Description                                        |
 |---------------------|----------------------------------------------------|
 | `login`             | Authenticate via OAuth2 (opens browser)            |
@@ -250,11 +291,11 @@ validation errors, and summarize what each process does.
 | `show-project`      | Show a project's stages and parent folder          |
 | `pull-folder`       | Export an entire folder/stage to local files       |
 | `pull-process`      | Export a single process to a `.conv.json` file     |
-| `push-process`      | Validate and deploy a `.conv.json` to Corezoid     |
+| `push-process`      | Validate and deploy a `.conv.json` to Corezoid. Blocks when the graph is structurally invalid, when the server changed since pull (`force` is the lint override only — the concurrency gate has its own `overwrite_server_change`), when no rollback point could be taken, or when the file has no pull baseline but the process is already deployed. Every waived gate is reported in the push result |
 | `clean-process`     | Remove inactive nodes, save a reviewable proposal as `<ID>_<title>.cleaned.json` |
 | `layout-process`    | Auto-arrange node coordinates (waterfall / layered / table-star regions); local, changes only x/y and collapse flags |
 | `lint-process`      | Validate process structure locally (no API call)   |
-| `run-task`          | Send a task to a deployed process                  |
+| `run-task`          | Send a task to a deployed process, by `process_path` or `process_id` (no local file needed) |
 | `show-task`         | Look up one task by `ref` and/or `task_id` — data, node, status (read-only) |
 | `list-node-tasks`   | List tasks currently sitting in a node             |
 | `list-task-history` | Show task execution history                        |
@@ -278,6 +319,7 @@ validation errors, and summarize what each process does.
 | `list-variables`    | List a stage's environment variables (secrets masked) |
 | `modify-variable`   | Change a variable's value/title/data_type or rename it — dry-run + confirm-gated |
 | `delete-variable`   | PERMANENTLY delete a variable (no recycle bin) — dry-run + confirm-gated |
+| `create-communications-orchestrator` | Build a multi-platform messenger robot (Telegram / Facebook Messenger / Viber / Apple Messages) — queues the `bot_wizzard` build, polls it every 3s up to 10 times, and returns the generated `folder_url` or the wizard's error. Irreversible, so it builds only with `apply=true` plus the confirm token its `apply=false` dry-run prints |
 | `create-dashboard`  | Create a new dashboard for visualizing node metrics |
 | `get-dashboard`     | Get a dashboard with its charts and series         |
 | `add-chart`         | Add a chart (column, pie, funnel, table) to a dashboard |
@@ -300,10 +342,10 @@ validation errors, and summarize what each process does.
 | `find-principal`    | Resolve user / group / API-key name to obj_id      |
 | `invite-user`       | Invite an external email and share an object in one call |
 | `send-feedback`     | Submit feedback about plugin behavior (returns ticket id) |
-| `create-snapshot`   | Create a snapshot of the current server state of a process (auto-created before every push-process on existing processes) |
-| `list-snapshots`    | List all snapshots for a process with version, title, author and creation time |
-| `delete-snapshot`   | Delete a snapshot by its obj_id |
-| `get-snapshot`      | Get the node list of a specific snapshot for diff comparison |
+| `create-snapshot`   | Create a snapshot of the current server state of a process, by `process_path` or `process_id`. Also auto-created before `push-process` overwrites an existing process: if the snapshot call fails the push is blocked, and if the target project/stage cannot be resolved the push is blocked too — both waived by `allow_no_snapshot=true` on a resolved mutable stage, though retrying a failed call is the safer default. Skipped only where there is nothing to preserve — a process with no deployed version, or an installation whose API has no snapshot object. A push that overwrites live server state without comparing it (`overwrite_server_change`, or `adopt_existing` on a file with no baseline) is refused when no snapshot was taken, unless `allow_no_snapshot=true` is passed as well; a never-deployed process is exempt — it has no previous version to preserve |
+| `list-snapshots`    | List all snapshots for a process with version, title, author and creation time, by `process_path` or `process_id` |
+| `delete-snapshot`   | Delete a snapshot by its obj_id, by `process_path` or `process_id` |
+| `get-snapshot`      | Get the node list of a specific snapshot for diff comparison, by `process_path` or `process_id` |
 | `git-pull-context`  | Clone or pull the Corezoid git mirror into `.git-context/` |
 | `git-push-context`  | Commit and push `_ext/` changes to the git mirror  |
 | `read-context-file` | Read a file from `.git-context/`                   |
@@ -347,6 +389,7 @@ Claude Code / Codex
         ├── Tasks         run-task, show-task, list-node-tasks, list-task-history,
         │                 get-node-stat, modify-task, delete-task
         ├── Snapshots     create-snapshot, list-snapshots, delete-snapshot, get-snapshot
+        ├── Bots          create-communications-orchestrator
         ├── Dashboards    create-dashboard, get-dashboard, add-chart,
         │                 modify-chart, get-chart, set-dashboard-layout
         ├── Access        share-object, list-shares,
@@ -393,6 +436,8 @@ corezoid-ai-plugin/
 │   │   ├── corezoid-variable-manager/      # Environment variable management skill
 │   │   ├── corezoid-api-connector/         # Corezoid public-API caller skill
 │   │   ├── corezoid-gitcall/               # git_call custom-code skill
+│   │   ├── corezoid-gen-bot/               # Messenger bot generation skill
+│   │   ├── corezoid-edit-bot/              # Messenger bot editing skill
 │   │   ├── corezoid-access/                # Sharing, groups, API keys skill
 │   │   ├── corezoid-retro/                 # End-of-session retrospective skill
 │   │   ├── corezoid-feedback/              # Bug / improvement reporting skill
